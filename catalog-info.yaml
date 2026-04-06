@@ -1,0 +1,25 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: blitzy-grafana
+  description: "Grafana observability platform fork — exploring AI-assisted plugin and dashboard development"
+  tags:
+    - go
+    - scaffolded
+  labels:
+    blitzy.com/status: scaffolded
+    blitzy.com/language: go
+  annotations:
+    github.com/project-slug: Blitzy-Sandbox/blitzy-grafana
+    backstage.io/source-location: url:https://github.com/Blitzy-Sandbox/blitzy-grafana/tree/main/
+  links:
+    - url: https://github.com/Blitzy-Sandbox/blitzy-grafana
+      title: GitHub Repository
+    - url: https://github.com/Blitzy-Sandbox/blitzy-grafana/tree/main/blitzy/documentation
+      title: Blitzy Documentation
+      icon: docs
+spec:
+  type: website
+  lifecycle: experimental
+  owner: blitzy-sandbox
+  system: blitzy-sandbox-projects
