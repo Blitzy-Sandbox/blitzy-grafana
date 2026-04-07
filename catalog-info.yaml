@@ -23,4 +23,4 @@ spec:
   type: website
   lifecycle: experimental
   owner: blitzy-sandbox
-  system: blitzy-sandbox-projects
+  system: blitzy-go
