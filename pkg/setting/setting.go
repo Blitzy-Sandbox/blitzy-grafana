@@ -477,9 +477,13 @@ type Cfg struct {
 	// from os.Getenv("GF_NLQ_LLM_API_KEY") inside pkg/services/nlq/translate.go.
 	//
 	// Field semantics:
-	//   - NLQEnabled: operator kill switch. When false, pkg/services/nlq.ProvideService skips
-	//     route registration even if the nlqEnabled feature toggle is on. BOTH gates must be
-	//     enabled for the /api/nlq/translate route to be live.
+	//   - NLQEnabled: operator kill switch enforced INSIDE pkg/services/nlq's request handler,
+	//     not at route registration. The /api/nlq/translate route is registered whenever the
+	//     nlqEnabled feature toggle is on (regardless of this field). When the toggle is on
+	//     and this field is false, every request short-circuits with HTTP 503
+	//     ErrServiceDisabled. When the toggle is off, the route is not registered at all
+	//     (HTTP 404) regardless of this field. BOTH the toggle (route + UI) and this field
+	//     (handler execution) must be enabled for the bar to be fully functional.
 	//   - NLQProvider: identifier of the LLM provider wire shape. Currently only "openai" is
 	//     fully supported. Other values fall back to OpenAI-compatible semantics with a
 	//     warning logged from readNLQSettings. Validated centrally so any future provider
