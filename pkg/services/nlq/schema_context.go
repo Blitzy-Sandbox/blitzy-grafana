@@ -172,7 +172,13 @@ func (s *Service) fetchSchemaContext(ctx context.Context, req TranslateRequest, 
 		OrgID: orgID,
 	})
 	if err != nil {
-		s.log.Debug("NLQ feature: datasource lookup failed (hard error)",
+		// NLQ CP10 O-FINDING-1 fix: promoted from Debug to Warn so
+		// operator observability of degraded schema-fetch paths is
+		// visible at the default log level (info). Level promotion
+		// only — message and structured fields are unchanged and
+		// remain safe per AAP §0.8.5 (no API key, no prompt, no
+		// LLM response leaked).
+		s.log.Warn("NLQ feature: datasource lookup failed (hard error)",
 			"datasourceUID", req.DatasourceUID,
 			"orgID", orgID,
 			"err", err,
@@ -219,7 +225,13 @@ func (s *Service) fetchSchemaContext(ctx context.Context, req TranslateRequest, 
 	// error so Translate downgrades it to a warning.
 	live, fetchErr := s.fetchLiveSchema(ctx, ds, claimedType, user)
 	if fetchErr != nil {
-		s.log.Debug("NLQ feature: live schema metadata fetch failed (soft error)",
+		// NLQ CP10 O-FINDING-1 fix: promoted from Debug to Warn.
+		// The CP10 OBSERVABILITY scope spec mandates a WARN-level
+		// entry when schema fetch fails so operators retain
+		// visibility into graceful-degradation paths at the
+		// default log level. Level promotion only — fields are
+		// unchanged and remain safe per AAP §0.8.5.
+		s.log.Warn("NLQ feature: live schema metadata fetch failed (soft error)",
 			"datasourceUID", req.DatasourceUID,
 			"datasourceType", claimedType,
 			"err", fetchErr,

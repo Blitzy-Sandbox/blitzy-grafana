@@ -509,7 +509,15 @@ func (s *Service) Translate(ctx context.Context, req TranslateRequest, orgID int
 		// but the live metadata fetch was unsuccessful. Continue
 		// with the (possibly partially populated) base schema
 		// context returned by fetchSchemaContext.
-		s.log.Debug(
+		//
+		// NLQ CP10 O-FINDING-1 fix: promoted from Debug to Warn so
+		// the graceful-degradation event surfaces at the default
+		// log level (info). The Warnings entry is also returned to
+		// the caller; together they ensure operators AND callers
+		// see the schema-fetch fallback. Level promotion only —
+		// structured fields are unchanged and remain safe per
+		// AAP §0.8.5 (no input content, no LLM response, no key).
+		s.log.Warn(
 			"NLQ feature: live schema metadata fetch failed; proceeding with base hints",
 			"datasourceUID", req.DatasourceUID,
 			"err", schemaErr,
