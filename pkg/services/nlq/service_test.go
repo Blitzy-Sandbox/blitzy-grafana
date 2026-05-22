@@ -518,6 +518,186 @@ func TestTranslate_LokiSuccess(t *testing.T) {
 		"the response language must be 'logql' for a Loki datasource")
 }
 
+// TestTranslate_LokiSchemaFetch_PathIsSinglePrefixed pins the
+// integration contract between (*Service).fetchLiveSchema (the
+// "loki" branch in schema_context.go) and the Loki plugin's
+// CallResource handler at pkg/tsdb/loki/loki.go:callResource.
+//
+// MAJOR QA REGRESSION (CP9 integration, Phase 19): the previous
+// implementation passed the FULL path "loki/api/v1/labels" to
+// CallResource, which the Loki plugin then double-prefixed via
+// `lokiURL := fmt.Sprintf("/loki/api/v1/%s", url)` — producing the
+// invalid upstream URL "/loki/api/v1/loki/api/v1/labels" and
+// silently degrading every Loki translation to the base-hints
+// fallback. The fix is to pass only the suffix "labels" so the
+// plugin composes the canonical URL "/loki/api/v1/labels".
+//
+// This test locks the contract in place:
+//
+//  1. The plugin client is a FakePluginClient with a custom
+//     CallResourceHandlerFunc that CAPTURES the incoming
+//     req.Path and req.URL and, when they match the expected
+//     suffix "labels", replies with a valid Prometheus/Loki
+//     `{status, data}` envelope containing a sentinel live
+//     label name. Any other path string causes the handler to
+//     fail the test outright with assert.Fail so a future
+//     regression (e.g. reverting to the double-prefixed form,
+//     or accidentally introducing a leading slash) is detected
+//     immediately rather than masked by the SOFT-failure
+//     fallback.
+//  2. The mock LLM endpoint captures the outbound system prompt
+//     so we can verify that the SUCCESSFUL live label was
+//     merged into the prompt (rather than the warning-fallback
+//     path firing and leaving the prompt with base hints only).
+//  3. The TranslateResponse is asserted to have NO Warnings,
+//     confirming that the live schema fetch succeeded end-to-end
+//     and was not silently downgraded by a path mismatch.
+//
+// Together these three assertions exhaustively prove that
+// schema_context.go's Loki branch hands the Loki plugin a path
+// suffix the plugin can route correctly — the precise inverse
+// of the CP9 QA regression.
+func TestTranslate_LokiSchemaFetch_PathIsSinglePrefixed(t *testing.T) {
+	t.Setenv("GF_NLQ_LLM_API_KEY", testAPIKey)
+
+	// liveLokiLabel is a sentinel label name unlikely to collide
+	// with any base hint in buildBaseSchemaContext's Loki seed
+	// (which uses canonical names like "job", "namespace", "pod",
+	// etc.). Its presence in the outbound LLM prompt proves the
+	// live fetch succeeded AND its result was merged in.
+	const liveLokiLabel = "qa_cp9_live_label"
+
+	// pathReceived captures the Path/URL fields the NLQ service
+	// hands to the plugin. We assert against them after the
+	// translation completes so failure messages reference the
+	// captured value rather than a fragile string-equality check
+	// inside the handler.
+	var (
+		mu              sync.Mutex
+		pathReceived    string
+		urlReceived     string
+		callResourceN   int
+		unexpectedPaths []string
+	)
+
+	lokiPluginClient := &pluginfakes.FakePluginClient{
+		CallResourceHandlerFunc: backend.CallResourceHandlerFunc(func(_ context.Context, req *backend.CallResourceRequest, sender backend.CallResourceResponseSender) error {
+			mu.Lock()
+			callResourceN++
+			pathReceived = req.Path
+			urlReceived = req.URL
+			pathOK := req.Path == "labels" && req.URL == "labels"
+			if !pathOK {
+				unexpectedPaths = append(unexpectedPaths, fmt.Sprintf("Path=%q URL=%q", req.Path, req.URL))
+			}
+			mu.Unlock()
+
+			if !pathOK {
+				// Return an error so the SOFT-failure fallback fires
+				// and the test surfaces a clear assertion at the
+				// outer level (`require.Empty(t, unexpectedPaths)`)
+				// rather than a confusing "warning unexpectedly
+				// present" downstream failure.
+				return errors.New("unexpected Loki resource path — see test assertions")
+			}
+
+			// Canonical Prometheus / Loki labels response envelope.
+			// pkg/services/nlq/schema_context.go's callDatasourceResource
+			// unmarshals exactly this shape: {status, data}.
+			body := fmt.Sprintf(`{"status":"success","data":["%s"]}`, liveLokiLabel)
+			return sender.Send(&backend.CallResourceResponse{
+				Status: http.StatusOK,
+				Headers: map[string][]string{
+					"Content-Type": {"application/json"},
+				},
+				Body: []byte(body),
+			})
+		}),
+	}
+
+	// outboundSystemPrompt captures the system prompt sent to the
+	// LLM so we can prove the live label was merged into it.
+	var (
+		llmMu                sync.Mutex
+		outboundSystemPrompt string
+	)
+	mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var payload struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.Unmarshal(raw, &payload)
+		llmMu.Lock()
+		for _, m := range payload.Messages {
+			if m.Role == "system" {
+				outboundSystemPrompt = m.Content
+				break
+			}
+		}
+		llmMu.Unlock()
+
+		resp := map[string]any{
+			"choices": []map[string]any{
+				{
+					"message": map[string]any{
+						"content": `{"query": "{job=\"varlogs\"} |= \"err\"", "explanation": "errors in varlogs"}`,
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer mockLLM.Close()
+
+	svc := newTestService(t, mockLLM.URL)
+	// Override the default failingCallResourceFunc with the
+	// strict-path-asserting plugin client constructed above.
+	svc.pluginClient = lokiPluginClient
+
+	resp, err := svc.Translate(context.Background(), TranslateRequest{
+		NaturalLanguage: "Show me errors in varlogs",
+		DatasourceUID:   "loki-uid",
+		DatasourceType:  "loki",
+	}, testOrgID, nil)
+
+	require.NoError(t, err, "Translate must succeed on a well-formed Loki request with a working live schema fetch")
+
+	// (1) Path contract — the precise inverse of the CP9 QA
+	// regression. Path AND URL must both equal "labels".
+	mu.Lock()
+	require.Empty(t, unexpectedPaths,
+		"NLQ feature MAJOR fix (CP9 integration QA finding): the Loki resource path MUST be the single-segment suffix \"labels\" so the Loki plugin's `lokiURL := fmt.Sprintf(\"/loki/api/v1/%%s\", url)` composes the canonical URL \"/loki/api/v1/labels\". Got: %v", unexpectedPaths)
+	assert.Equal(t, "labels", pathReceived,
+		"req.Path passed to the Loki plugin MUST be \"labels\" — not \"loki/api/v1/labels\" (that would be double-prefixed by the plugin)")
+	assert.Equal(t, "labels", urlReceived,
+		"req.URL passed to the Loki plugin MUST be \"labels\" — Loki plugin reads req.URL for the path suffix (see pkg/tsdb/loki/loki.go:callResource)")
+	assert.Equal(t, 1, callResourceN,
+		"the Loki schema fetch MUST invoke CallResource exactly once for the labels endpoint")
+	mu.Unlock()
+
+	// (2) End-to-end success — no Warnings means the live fetch
+	// completed and was merged into the prompt rather than
+	// falling through to the SOFT-failure base-hints fallback.
+	assert.Empty(t, resp.Warnings,
+		"a successful live Loki schema fetch MUST NOT produce any Warnings — Warnings here would mean the fix has regressed and the path is being double-prefixed again, with the soft-failure fallback masking it")
+
+	// (3) Prompt enrichment — the live label sentinel MUST be
+	// present in the system prompt the LLM saw. This proves the
+	// live fetch's result was merged into the LLM prompt rather
+	// than discarded.
+	llmMu.Lock()
+	defer llmMu.Unlock()
+	require.NotEmpty(t, outboundSystemPrompt,
+		"the test mock LLM MUST have observed a non-empty system prompt — if this is empty, the upstream call did not happen, indicating an unrelated regression")
+	assert.Contains(t, outboundSystemPrompt, liveLokiLabel,
+		"the live Loki label %q returned by the FakePluginClient MUST appear in the outbound LLM system prompt — its absence would mean the live fetch's data was not merged into the prompt", liveLokiLabel)
+	assert.Equal(t, "logql", resp.Language,
+		"the response language MUST remain 'logql' for a Loki datasource even after the schema-fetch fix")
+}
+
 // TestTranslate_UnsupportedDatasource validates AAP §0.6.4 row 9
 // (backend side): an unsupported datasource type must short-
 // circuit BEFORE any HTTP request reaches the LLM, returning

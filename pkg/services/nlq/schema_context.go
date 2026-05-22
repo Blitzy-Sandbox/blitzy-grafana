@@ -45,17 +45,30 @@
 //   - the plugin's CallResource implementation
 //
 // Endpoint mapping (matches the upstream contracts that the
-// Prometheus and Loki backends implement):
+// Prometheus and Loki backends implement). The path strings below
+// are the values passed verbatim to callDatasourceResource and from
+// there into backend.CallResourceRequest.URL; they are NOT the full
+// upstream URLs. Each plugin assembles the final upstream URL from
+// the datasource URL plus this path, and the Prometheus and Loki
+// plugins differ in how they do that — see the per-plugin notes.
 //
 //   - Prometheus / Mimir:
 //     Path "api/v1/labels"                        — label names
 //     Path "api/v1/label/__name__/values"         — metric names
-//     (see pkg/promlib/resource/resource.go for the canonical
-//     proxy registration of these paths.)
+//     The Prometheus plugin (pkg/promlib/resource/resource.go) does
+//     NOT add any prefix, so these paths are supplied with their
+//     full "api/v1/..." form.
 //   - Loki:
-//     Path "loki/api/v1/labels"                   — log-stream
+//     Path "labels"                               — log-stream
 //     label names
-//     (see pkg/tsdb/loki/api.go for the resource handler.)
+//     The Loki plugin (pkg/tsdb/loki/loki.go:callResource)
+//     UNCONDITIONALLY prepends "/loki/api/v1/" to req.URL via
+//     `lokiURL := fmt.Sprintf("/loki/api/v1/%s", url)`, so the
+//     path passed here MUST be the suffix relative to that prefix.
+//     Passing the full "loki/api/v1/labels" would double-prefix
+//     to "/loki/api/v1/loki/api/v1/labels" and 404 on every real
+//     Loki server. NLQ feature MAJOR fix (CP9 integration QA
+//     finding) — see fetchLiveSchema's "loki" branch for details.
 //
 // SECURITY (AAP §0.8.5):
 //   - The plugin context construction reads decrypted
@@ -304,9 +317,33 @@ func (s *Service) fetchLiveSchema(ctx context.Context, ds *datasources.DataSourc
 		return live, nil
 
 	case "loki":
-		// Fetch label names from "loki/api/v1/labels". See
-		// pkg/tsdb/loki/api.go which serves the same contract.
-		labels, err := s.callDatasourceResource(ctx, ds, user, "loki/api/v1/labels")
+		// NLQ feature MAJOR fix (CP9 integration QA finding —
+		// double-prefixed Loki resource path).
+		//
+		// Fetch label names from the canonical Loki labels
+		// endpoint. The path passed here MUST be relative to the
+		// `/loki/api/v1/` prefix that the Loki plugin's
+		// CallResource handler unconditionally prepends in
+		// pkg/tsdb/loki/loki.go:callResource —
+		//   lokiURL := fmt.Sprintf("/loki/api/v1/%s", req.URL)
+		// Passing "loki/api/v1/labels" would compose to the
+		// double-prefixed URL "/loki/api/v1/loki/api/v1/labels"
+		// which 404s against every real Loki server (and against
+		// any strict path-equality QA mock). Passing the
+		// suffix "labels" composes the correct canonical URL
+		// "/loki/api/v1/labels" — matching the contract
+		// documented at AAP §0.4.3.6 and the upstream Loki HTTP
+		// API.
+		//
+		// The Prometheus branch above is NOT analogous: the
+		// Prometheus plugin's CallResource handler does NOT add
+		// any prefix, so the Prom paths are supplied with their
+		// full "api/v1/..." form. This asymmetry is a property
+		// of the two plugin implementations — see
+		// pkg/promlib/resource/resource.go for the Prom
+		// pass-through and pkg/tsdb/loki/loki.go:129 for the
+		// Loki prefix wrapper.
+		labels, err := s.callDatasourceResource(ctx, ds, user, "labels")
 		if err != nil {
 			return SchemaContext{}, fmt.Errorf("loki labels fetch: %w", err)
 		}
