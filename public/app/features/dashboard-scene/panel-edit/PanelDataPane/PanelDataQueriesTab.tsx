@@ -24,6 +24,8 @@ import { ExpressionTypeDropdown } from 'app/features/expressions/components/Expr
 import { ExpressionQueryType } from 'app/features/expressions/types';
 import { getDefaults } from 'app/features/expressions/utils/expressionTypes';
 import { InspectTab } from 'app/features/inspector/types';
+// NLQ feature: import the natural language query bar (gated by config.featureToggles.nlqEnabled)
+import { NaturalLanguageQueryBar } from 'app/features/nlq';
 import { GroupActionComponents } from 'app/features/query/components/QueryActionComponent';
 import { QueryEditorRows } from 'app/features/query/components/QueryEditorRows';
 import { QueryGroupTopSection } from 'app/features/query/components/QueryGroup';
@@ -395,6 +397,10 @@ export function PanelDataQueriesTabRendered({ model }: SceneComponentProps<Panel
 
   return (
     <div data-testid={selectors.components.QueryTab.content}>
+      {/* NLQ feature: conditional render of the natural language query bar, gated by feature toggle */}
+      {config.featureToggles.nlqEnabled && dsSettings && (
+        <NaturalLanguageQueryBar dsSettings={dsSettings} panelRef={model.state.panelRef} />
+      )}
       <QueryGroupTopSection
         data={data}
         dsSettings={dsSettings}
