@@ -9,10 +9,10 @@
 //
 // Per AAP §0.2.1 this module deliberately uses `getBackendSrv()` rather than
 // RTK Query because the endpoint is a single request/response with no caching
-// benefit. Per AAP §0.8.5 the LLM API key is NEVER transmitted from the
-// frontend — it is read on the server from the `GF_NLQ_LLM_API_KEY` environment
-// variable. The browser is authenticated by the standard Grafana session cookie
-// that `getBackendSrv()` attaches automatically.
+// benefit. Per AAP §0.8.5 the server-side LLM credential is NEVER transmitted
+// from the frontend — it is held server-side only. The browser is
+// authenticated by the standard Grafana session cookie that `getBackendSrv()`
+// attaches automatically.
 
 import { getBackendSrv } from '@grafana/runtime';
 
@@ -35,9 +35,9 @@ const NLQ_TRANSLATE_ENDPOINT = '/api/nlq/translate';
  * backend NLQ service.
  *
  * Authentication is handled implicitly by `getBackendSrv()` (cookie-based session
- * attached by the browser). The LLM API key is NEVER sent from the frontend —
- * it lives only on the server in the `GF_NLQ_LLM_API_KEY` environment variable
- * (per AAP §0.8.5). Callers therefore do not need to provide any credentials.
+ * attached by the browser). The server-side LLM credential is NEVER sent from
+ * the frontend — it is held server-side only (per AAP §0.8.5). Callers
+ * therefore do not need to provide any credentials.
  *
  * Errors (network failure, 4xx, 5xx) bubble up as a rejected promise. Callers
  * are expected to catch them and surface them through an `<Alert>` component

@@ -25,14 +25,16 @@
 //   - Case 4 → criterion #9 (unsupported datasource short-circuits, no HTTP)
 //   - Case 5 → empty-input short-circuit (defensive, no HTTP)
 //   - Case 6 → warnings propagation
-//   - Case 7 → reset() clears all derived translation state
+//   - Case 7 → reset() clears all derived translation state (Prometheus path)
+//   - Case 8 → reset() clears isUnsupportedDatasource (MySQL path; checkpoint
+//             contract that the flag is state-backed and cleared by reset())
 
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
 
-import { DataSourceInstanceSettings } from '@grafana/data';
-import { setBackendSrv } from '@grafana/runtime';
+import type { DataSourceInstanceSettings } from '@grafana/data';
+import { getBackendSrv, setBackendSrv, type BackendSrv } from '@grafana/runtime';
 import { backendSrv } from 'app/core/services/backend_srv';
 
 import { useNLQTranslation } from './useNLQTranslation';
@@ -49,16 +51,36 @@ import { useNLQTranslation } from './useNLQTranslation';
 // each test owns its own response contract.
 const server = setupServer();
 
-// Register the real `backendSrv` instance as the `@grafana/runtime` singleton
-// returned by `getBackendSrv()`. This MUST happen at module load (i.e. before
-// any test runs) so the hook's `postTranslate` call resolves to a working
-// service. We deliberately use the real `backendSrv` rather than a stub so
-// that MSW intercepts the actual production code path through `nlqApi.ts`
-// (AAP §0.6.1.4 key insight: "DO NOT mock `getBackendSrv` directly — let MSW
-// intercept the actual fetch call").
-setBackendSrv(backendSrv);
+// Capture the prior `@grafana/runtime` backendSrv singleton (if any) BEFORE
+// we overwrite it for this test file. `getBackendSrv()` returns `undefined`
+// when no singleton has been registered yet (the default state for unit
+// tests that have not loaded the bootstrap). We store the prior value in a
+// `let` (typed as `BackendSrv | undefined`) so the `afterAll` hook can
+// restore it, preventing cross-suite global-state pollution when Jest runs
+// multiple test files in the same worker process.
+let priorBackendSrv: BackendSrv | undefined;
 
 beforeAll(() => {
+  // Snapshot the prior backendSrv so we can restore it in `afterAll`. This
+  // matters when Jest runs this file alongside other suites in the same
+  // worker — without restoration, the mutation we make below would leak
+  // into the next file's tests.
+  //
+  // The runtime `getBackendSrv()` declaration returns `BackendSrv`, but in
+  // unit-test contexts where the bootstrap has not run the underlying
+  // singleton is actually `undefined`. We coerce defensively so the
+  // restoration branch below can correctly detect "no prior singleton".
+  const current: BackendSrv | undefined = getBackendSrv();
+  priorBackendSrv = current;
+
+  // Register the real `backendSrv` instance as the `@grafana/runtime`
+  // singleton returned by `getBackendSrv()`. We deliberately use the real
+  // `backendSrv` rather than a stub so that MSW intercepts the actual
+  // production code path through `nlqApi.ts` (AAP §0.6.1.4 key insight:
+  // "DO NOT mock `getBackendSrv` directly — let MSW intercept the actual
+  // fetch call").
+  setBackendSrv(backendSrv);
+
   // CRITICAL: `onUnhandledRequest: 'error'` ensures that the unsupported-
   // datasource short-circuit test (Case 4) and the empty-input short-circuit
   // test (Case 5) FAIL LOUDLY if the hook ever makes a request when it
@@ -70,8 +92,9 @@ beforeAll(() => {
 
 afterEach(() => {
   // Drop all per-test handlers so leakage from one test cannot pollute the
-  // next. The `setBackendSrv(backendSrv)` registration at module load is
-  // intentionally NOT reset here — the singleton remains valid across tests.
+  // next. The `setBackendSrv(backendSrv)` registration in `beforeAll` is
+  // intentionally NOT reset here — the singleton remains valid across tests
+  // in THIS file; cross-file restoration happens in `afterAll`.
   server.resetHandlers();
 });
 
@@ -79,6 +102,18 @@ afterAll(() => {
   // Tear down the MSW interceptor cleanly so it does not affect other test
   // files when Jest runs the suite under `--maxWorkers > 1`.
   server.close();
+
+  // Restore the prior backendSrv singleton if there was one, preventing
+  // cross-suite global-state pollution. If `priorBackendSrv` is undefined
+  // (the common case in isolated test runs), we leave our `backendSrv`
+  // registration in place — calling `setBackendSrv(undefined as never)`
+  // would deliberately break subsequent files, which is the OPPOSITE of
+  // what we want. The risk of leaving `backendSrv` registered is benign:
+  // any downstream test that runs without MSW will hit the real `fetch`
+  // and fail loudly with a network error.
+  if (priorBackendSrv !== undefined) {
+    setBackendSrv(priorBackendSrv);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -327,16 +362,17 @@ describe('useNLQTranslation', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Case 7 — reset()
+  // Case 7 — reset() clears all derived translation state
   //
   // `reset()` is the explicit contract by which the parent bar abandons a
   // prior translation (e.g. when the user switches datasources or closes
   // the collapsible). All derived translation fields MUST return to their
-  // initial values; `isUnsupportedDatasource` is intentionally NOT reset
-  // because it is derived from the current `dsSettings.type` prop and not
-  // from internal state.
+  // initial values, INCLUDING `isUnsupportedDatasource` per the checkpoint
+  // contract. For a supported (Prometheus) datasource, the flag was already
+  // `false` from the lazy initializer, so this test exercises the "stays
+  // false through reset" branch.
   // -------------------------------------------------------------------------
-  it('reset() clears all translation state', async () => {
+  it('reset() clears all translation state for supported datasource', async () => {
     server.use(
       http.post('/api/nlq/translate', () =>
         HttpResponse.json({
@@ -373,8 +409,58 @@ describe('useNLQTranslation', () => {
     expect(result.current.explanation).toBe('');
     expect(result.current.warnings).toEqual([]);
     expect(result.current.error).toBeNull();
-    // The supported-datasource flag is independent of internal state, so
-    // it remains derived from the (still Prometheus) dsSettings prop.
+    // The supported-datasource flag stays `false` for Prometheus — it was
+    // already `false` from the lazy initializer; `reset()` also re-sets it
+    // to `false` per the checkpoint contract (see the dedicated
+    // unsupported-datasource test below for the more interesting branch).
     expect(result.current.isUnsupportedDatasource).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // Case 8 — reset() clears isUnsupportedDatasource for unsupported datasource
+  //
+  // The checkpoint contract requires `reset()` to clear `isUnsupportedDatasource`.
+  // For a Prometheus datasource the flag starts at `false` and stays `false`,
+  // so the cleared-by-reset branch is trivially exercised. This test exercises
+  // the meaningful branch: an unsupported datasource starts with the flag at
+  // `true` and `reset()` MUST set it back to `false`.
+  //
+  // Note: a subsequent call to `translate()` will re-set the flag because
+  // `translate()` re-evaluates the current `dsSettings.type` on every
+  // invocation. Verified at the end of this test so the contract is fully
+  // explicit: reset() clears the flag, but the runtime short-circuit is
+  // preserved on the next `translate()` call.
+  // -------------------------------------------------------------------------
+  it('reset() clears isUnsupportedDatasource for unsupported datasource', async () => {
+    const { result } = renderHook(() => useNLQTranslation(makeDs('mysql')));
+
+    // Initial state — derived lazily from `dsSettings.type === 'mysql'`.
+    expect(result.current.isUnsupportedDatasource).toBe(true);
+
+    // reset() MUST clear `isUnsupportedDatasource` per the checkpoint
+    // contract. Synchronous state setter — wrap in `act` so the re-render
+    // is flushed before the assertion.
+    act(() => {
+      result.current.reset();
+    });
+
+    expect(result.current.isUnsupportedDatasource).toBe(false);
+    // All other state remains in its initial empty form — reset is a
+    // complete clear, not a partial one.
+    expect(result.current.translatedQuery).toBe('');
+    expect(result.current.language).toBe('');
+    expect(result.current.explanation).toBe('');
+    expect(result.current.warnings).toEqual([]);
+    expect(result.current.error).toBeNull();
+    expect(result.current.isLoading).toBe(false);
+
+    // Re-asserting the runtime guard: calling translate() AFTER reset()
+    // with the same (still-unsupported) dsSettings.type re-evaluates the
+    // prop and re-asserts the flag. MSW's `onUnhandledRequest: 'error'`
+    // would also fail this test if a network call leaked through.
+    await act(async () => {
+      await result.current.translate('Will not fire');
+    });
+    expect(result.current.isUnsupportedDatasource).toBe(true);
   });
 });

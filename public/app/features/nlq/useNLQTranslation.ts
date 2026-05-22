@@ -30,39 +30,48 @@
 //     resilience pattern. Per AAP §0.2.1 the translate endpoint is
 //     request/response with no caching benefit, so RTK Query / SWR / React
 //     Query / similar libraries are deliberately NOT used.
-//   - Never logs the user's input or the LLM response payload. The LLM API
-//     key never reaches the browser (it is read on the server from
-//     `GF_NLQ_LLM_API_KEY` — AAP §0.8.5), so there is no secret to leak
-//     from this hook; the no-log constraint is enforced here to prevent
-//     accidental telemetry of user-typed natural-language content.
+//   - Never logs the user's input or the LLM response payload. The LLM
+//     credential never reaches the browser — it is held server-side only
+//     (see backend service docs for the exact mechanism). The no-log
+//     constraint is enforced here to prevent accidental telemetry of
+//     user-typed natural-language content.
 //   - Single-turn only: each call to `translate()` is independent; the hook
 //     does NOT maintain conversation history (AAP §0.7.2.3).
 
 import { useCallback, useState } from 'react';
 
-import { DataSourceInstanceSettings } from '@grafana/data';
+import type { DataSourceInstanceSettings } from '@grafana/data';
 
 import { postTranslate } from './nlqApi';
 
 /**
- * NLQ feature: string literal union of the datasource types for which the
- * NLQ bar will actually call the backend translation service. The supported
- * set is closed and limited to Prometheus-compatible (`prometheus`) and Loki
- * (`loki`) per AAP §0.6.3.1.
+ * NLQ feature: closed set of datasource `type` strings for which the NLQ bar
+ * will actually call the backend translation service.
  *
- * Mimir uses the `prometheus` datasource plugin type (Mimir is wire-compatible
- * with the Prometheus query API), so it is supported by inclusion in this
- * literal union — no separate `mimir` entry is required.
+ * Per AAP §0.6.3.1, only Prometheus-compatible backends (`prometheus`) and
+ * Loki (`loki`) are in scope for this release. Mimir uses the `prometheus`
+ * plugin type (Mimir is wire-compatible with the Prometheus query API), so
+ * it is supported by inclusion in this constant — no separate `mimir` entry
+ * is required.
  *
- * Declared as a type alias rather than a string array so that the type guard
- * below can use direct literal comparisons (`type === 'prometheus'`) — this
- * matches the pattern used elsewhere in the codebase (e.g.
- * `isEditableVariableType` in
- * `public/app/features/dashboard-scene/settings/variables/utils.ts`) and
- * avoids the type-assertion pattern that the project's
- * `@typescript-eslint/consistent-type-assertions: never` rule forbids.
+ * This constant is the single source of truth for the supported set: the
+ * runtime type guard iterates it via `Array.prototype.some` (see
+ * {@link isSupportedDatasourceType}), and the `SupportedDsType` type alias is
+ * derived from it via `(typeof SUPPORTED_DS_TYPES)[number]`. Adding a new
+ * datasource type to the supported set is therefore a single-line change here.
+ *
+ * The `as const` assertion narrows the array to a readonly tuple of literal
+ * types, which is required so that `SupportedDsType` resolves to the precise
+ * union `'prometheus' | 'loki'` rather than the widened `string`.
  */
-type SupportedDsType = 'prometheus' | 'loki';
+export const SUPPORTED_DS_TYPES = ['prometheus', 'loki'] as const;
+
+/**
+ * NLQ feature: string literal union of the datasource types for which the
+ * NLQ bar will actually call the backend translation service. Derived from
+ * {@link SUPPORTED_DS_TYPES} so the two stay in lockstep.
+ */
+type SupportedDsType = (typeof SUPPORTED_DS_TYPES)[number];
 
 /**
  * NLQ feature: user-defined type guard that determines whether the active
@@ -73,13 +82,19 @@ type SupportedDsType = 'prometheus' | 'loki';
  * on that narrowing — including the predicate keeps the function future-proof
  * if a caller ever needs the narrowed type.
  *
- * The implementation uses direct string equality rather than an
- * `Array.includes` lookup so that the project's no-type-assertions ESLint
- * rule is honored without introducing a separate widened-string-array
- * intermediate.
+ * Iterates through {@link SUPPORTED_DS_TYPES} with `Array.prototype.some` so
+ * the supported set is read directly from the constant — adding a new
+ * supported datasource type requires editing only the constant above.
+ *
+ * `some` (rather than `includes`) is used because `SUPPORTED_DS_TYPES.includes`
+ * requires its argument to be one of the tuple's literal types, which would
+ * require a type assertion to call with a `string` input — the project's
+ * `@typescript-eslint/consistent-type-assertions: never` rule forbids such
+ * assertions. The `some` callback widens each element to `string` naturally
+ * via the comparison, avoiding the need for any cast.
  */
 function isSupportedDatasourceType(type: string): type is SupportedDsType {
-  return type === 'prometheus' || type === 'loki';
+  return SUPPORTED_DS_TYPES.some((supported) => supported === type);
 }
 
 /**
@@ -126,14 +141,16 @@ export interface UseNLQTranslationResult {
   /**
    * NLQ feature: clears all translation state.
    *
-   * Resets `translatedQuery`, `language`, `explanation`, `warnings`, and
-   * `error` back to their initial values. Does NOT touch `isLoading` (a
-   * caller MUST NOT reset while a translation is in flight; doing so would
-   * leave the loading indicator stuck — the hook expects the user to wait
-   * for the in-flight call to settle first).
+   * Resets `translatedQuery`, `language`, `explanation`, `warnings`,
+   * `error`, AND `isUnsupportedDatasource` back to their initial values.
+   * Does NOT touch `isLoading` (a caller MUST NOT reset while a translation
+   * is in flight; doing so would leave the loading indicator stuck — the
+   * hook expects the user to wait for the in-flight call to settle first).
    *
-   * Does NOT change `isUnsupportedDatasource` because that flag is derived
-   * from the current `dsSettings.type` prop, not from internal state.
+   * `isUnsupportedDatasource` is cleared to `false` per the checkpoint
+   * contract. A subsequent call to `translate()` re-evaluates the current
+   * `dsSettings.type` and re-sets the flag to `true` if the datasource is
+   * unsupported, so the short-circuit guard remains fully enforced.
    */
   reset: () => void;
 
@@ -180,23 +197,33 @@ export interface UseNLQTranslationResult {
    * NLQ feature: populated on HTTP failure; `null` otherwise.
    *
    * Always an `Error` instance — non-Error throws are wrapped by the hook
-   * so that consumers can rely on the `.message` property without
+   * so that consumers can rely on the `.message` property existing without
    * runtime narrowing.
+   *
+   * IMPORTANT — i18n contract: consumers MUST NOT render `error.message`
+   * directly to the user. The `.message` value can be backend-supplied
+   * English text, browser-native fetch error text, or an empty string from
+   * a non-Error throw — none of which flow through the `t()`/`<Trans>`
+   * localization pipeline. Consumers SHOULD render a localized message
+   * (e.g. `t('nlq.error.generic', ...)`) and use `error` only as a boolean
+   * "did the translation fail" discriminator.
    */
   error: Error | null;
 
   /**
-   * NLQ feature: `true` when `dsSettings.type` is not in `{prometheus, loki}`.
+   * NLQ feature: `true` when the active datasource `type` is not in
+   * `{prometheus, loki}` (i.e. not in {@link SUPPORTED_DS_TYPES}).
    *
-   * When this is `true`, the hook will refuse to call the backend and
-   * `translate()` is a no-op. The parent `NaturalLanguageQueryBar` is
-   * expected to read this flag and render an `<Alert severity="warning">`
-   * with an "unsupported data source" message rather than the active
-   * NL input/preview UI, per AAP §0.6.3.1.
+   * When this is `true`, the parent `NaturalLanguageQueryBar` is expected to
+   * render an `<Alert severity="warning">` with an "unsupported data source"
+   * message rather than the active NL input/preview UI, per AAP §0.6.3.1.
    *
-   * Re-evaluated on every render from the current `dsSettings` prop so
-   * switching datasources within the same panel editor session flips this
-   * flag automatically without any side effect being required.
+   * Initial value is derived from the current `dsSettings.type` prop via a
+   * `useState` lazy initializer. The flag is also re-evaluated and re-set
+   * on every call to `translate()` so the runtime short-circuit always
+   * reflects the current `dsSettings.type` (and re-asserts the flag after a
+   * prior `reset()` has cleared it). `reset()` clears the flag back to
+   * `false` per the checkpoint contract.
    */
   isUnsupportedDatasource: boolean;
 }
@@ -238,13 +265,24 @@ export function useNLQTranslation(dsSettings: DataSourceInstanceSettings): UseNL
   const [warnings, setWarnings] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<Error | null>(null);
-
-  // Re-evaluated every render from the current dsSettings prop. Switching
-  // datasources without a re-mount therefore flips this flag automatically.
-  const isUnsupportedDatasource = !isSupportedDatasourceType(dsSettings.type);
+  // `isUnsupportedDatasource` is held as state (initialized lazily from the
+  // current `dsSettings.type` prop) rather than as a per-render derived
+  // value, so that `reset()` can clear it per the checkpoint contract.
+  // `translate()` re-evaluates the prop on every invocation and re-sets the
+  // flag, so the short-circuit guard remains fully enforced even after a
+  // prior `reset()` has cleared the flag.
+  const [isUnsupportedDatasource, setIsUnsupportedDatasource] = useState<boolean>(() =>
+    !isSupportedDatasourceType(dsSettings.type)
+  );
 
   /**
    * NLQ feature: clears all derived translation state.
+   *
+   * Clears every state field including `isUnsupportedDatasource` (which is
+   * set back to `false`) per the checkpoint contract. A subsequent call to
+   * `translate()` re-evaluates the current `dsSettings.type` and re-asserts
+   * the flag if the datasource is still unsupported, so this clearing is
+   * purely about state hygiene — the runtime short-circuit is preserved.
    *
    * Memoized with an empty dependency list because it references only state
    * setters (which React guarantees stable across renders). This keeps the
@@ -258,19 +296,18 @@ export function useNLQTranslation(dsSettings: DataSourceInstanceSettings): UseNL
     setExplanation('');
     setWarnings([]);
     setError(null);
+    setIsUnsupportedDatasource(false);
   }, []);
 
   /**
    * NLQ feature: fires the translation request.
    *
-   * Memoized with `[dsSettings.uid, dsSettings.type, isUnsupportedDatasource]`
-   * as dependencies so the callback identity is stable across re-renders that
-   * do not change the active datasource. We include `isUnsupportedDatasource`
-   * in addition to `dsSettings.type` even though one is derived from the
-   * other — `react-hooks/exhaustive-deps` requires every component-scope
-   * value referenced inside the callback to appear in the dependency list,
-   * and the two primitives change in lockstep so the extra dependency does
-   * not cause additional callback re-creations.
+   * Memoized with `[dsSettings.uid, dsSettings.type]` as dependencies so the
+   * callback identity is stable across re-renders that do not change the
+   * active datasource. The supported-datasource check is re-performed every
+   * call against the CURRENT `dsSettings.type` prop, so the short-circuit
+   * remains correct even after a prior `reset()` cleared the
+   * `isUnsupportedDatasource` state flag.
    *
    * State setters are intentionally omitted from the dependency list per
    * React's stability guarantee for setters returned by `useState`.
@@ -278,12 +315,21 @@ export function useNLQTranslation(dsSettings: DataSourceInstanceSettings): UseNL
   const translate = useCallback(
     async (input: string): Promise<void> => {
       // NLQ feature: short-circuit on unsupported datasource — no HTTP call
-      // is made. The parent bar is expected to render an `<Alert>` based on
-      // `isUnsupportedDatasource`, but this guard is the authoritative
-      // enforcement so a buggy caller cannot bypass the contract.
-      if (isUnsupportedDatasource) {
+      // is made. The check is performed against the current `dsSettings.type`
+      // prop on every invocation, not against the state flag, so the guard
+      // remains authoritative even after a prior `reset()` cleared the flag.
+      // We then re-assert the `isUnsupportedDatasource` state flag here so
+      // the parent UI re-renders the "unsupported data source" alert.
+      if (!isSupportedDatasourceType(dsSettings.type)) {
+        setIsUnsupportedDatasource(true);
         return;
       }
+
+      // Datasource is supported — ensure the state flag reflects that. If a
+      // prior `reset()` left it `false` and the prop has not changed, this
+      // is a no-op; if the prop has changed from unsupported to supported,
+      // this brings the flag in sync.
+      setIsUnsupportedDatasource(false);
 
       // NLQ feature: short-circuit on empty input — no HTTP call is made.
       // The trim is done first so a whitespace-only input is also rejected.
@@ -327,16 +373,29 @@ export function useNLQTranslation(dsSettings: DataSourceInstanceSettings): UseNL
         setExplanation(response.explanation ?? '');
         setWarnings(response.warnings ?? []);
       } catch (err) {
-        // Wrap non-Error throws so consumers can rely on `error.message`.
+        // Wrap non-Error throws so consumers can rely on `.message`.
         // The wrapping covers the three realistic shapes of a thrown value:
         //   1. An `Error` instance (the common case from getBackendSrv).
-        //   2. A bare string (some legacy throw sites).
-        //   3. Anything else (treat as opaque and use a generic message).
+        //   2. A bare string (some legacy throw sites are still in the
+        //      codebase) — wrapped in a new Error so the type is uniform.
+        //   3. Anything else — wrapped in a bare Error with an EMPTY message
+        //      so consumers do not display an unlocalized fallback string
+        //      to the user (component layer is responsible for rendering a
+        //      localized message via t()/Trans).
         // NOTE: we deliberately do NOT include the user's input or the raw
         // error payload in the message — those may contain sensitive data
-        // (per AAP §0.8.5 secret-handling discipline).
-        const wrapped =
-          err instanceof Error ? err : new Error(typeof err === 'string' ? err : 'NLQ translation failed');
+        // (per backend secret-handling discipline).
+        let wrapped: Error;
+        if (err instanceof Error) {
+          wrapped = err;
+        } else if (typeof err === 'string') {
+          wrapped = new Error(err);
+        } else {
+          // Empty-message Error: signals "translation failed" purely as a
+          // type discriminator. The component renders a localized
+          // `t('nlq.error.generic', ...)` string and ignores `error.message`.
+          wrapped = new Error();
+        }
         setError(wrapped);
         // Clear all derived translation state so the UI never shows a stale
         // query alongside the error alert.
@@ -348,7 +407,7 @@ export function useNLQTranslation(dsSettings: DataSourceInstanceSettings): UseNL
         setIsLoading(false);
       }
     },
-    [dsSettings.uid, dsSettings.type, isUnsupportedDatasource]
+    [dsSettings.uid, dsSettings.type]
   );
 
   return {

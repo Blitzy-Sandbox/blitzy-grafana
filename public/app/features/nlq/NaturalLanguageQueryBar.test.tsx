@@ -54,9 +54,9 @@ import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
 import { render } from 'test/test-utils';
 
-import { DataSourceInstanceSettings } from '@grafana/data';
+import type { DataSourceInstanceSettings } from '@grafana/data';
 import { config } from '@grafana/runtime';
-import { SceneObjectRef, VizPanel } from '@grafana/scenes';
+import type { SceneObjectRef, VizPanel } from '@grafana/scenes';
 
 import { NaturalLanguageQueryBar } from './NaturalLanguageQueryBar';
 
@@ -138,15 +138,20 @@ jest.mock('@grafana/ui', () => {
 // ---------------------------------------------------------------------------
 
 // A bare MSW server is created with no default handlers — each test registers
-// its own per-case handler via `server.use(...)`. The `onUnhandledRequest: 'bypass'`
-// option is set in `beforeAll` so that unrelated requests (e.g. internal
-// telemetry pings emitted by other modules during render) do not fail the
-// suite. Individual tests that need stricter behavior can override on a
-// per-test basis.
+// its own per-case handler via `server.use(...)`.
+//
+// `onUnhandledRequest: 'error'` is the FAIL-FAST setting: any HTTP request the
+// component issues that is NOT explicitly handled by a registered MSW handler
+// will reject loudly and fail the test. This is the safer default because the
+// component MUST NOT issue any HTTP request beyond `POST /api/nlq/translate`
+// (e.g. the unsupported-datasource test asserts that NO request is made even
+// when the user clicks "Translate"). `'bypass'` would silently let any
+// regression that bypassed the short-circuit guard through, which is
+// precisely the failure mode we want to detect.
 const server = setupServer();
 
 beforeAll(() => {
-  server.listen({ onUnhandledRequest: 'bypass' });
+  server.listen({ onUnhandledRequest: 'error' });
 });
 
 afterEach(() => {

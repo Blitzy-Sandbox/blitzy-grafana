@@ -53,10 +53,10 @@
 import { css } from '@emotion/css';
 import { useCallback, useEffect, useState } from 'react';
 
-import { DataSourceInstanceSettings, GrafanaTheme2 } from '@grafana/data';
+import type { DataSourceInstanceSettings, GrafanaTheme2 } from '@grafana/data';
 import { Trans, t } from '@grafana/i18n';
 import { config, reportInteraction } from '@grafana/runtime';
-import { SceneObjectRef, VizPanel } from '@grafana/scenes';
+import type { SceneObjectRef, VizPanel } from '@grafana/scenes';
 import { Alert, Button, CollapsableSection, Field, Spinner, Stack, TextArea, useStyles2 } from '@grafana/ui';
 
 import { NLQQueryPreview } from './NLQQueryPreview';
@@ -389,7 +389,20 @@ function NaturalLanguageQueryBarInner({ dsSettings, onAddPanel, onRun }: Natural
 
               {error && (
                 <Alert severity="error" title={errorTitle} data-testid="nlq-bar-error-alert">
-                  {error.message || errorGeneric}
+                  {/*
+                   * Always render the LOCALIZED generic error message —
+                   * never `error.message`. The hook may capture an arbitrary
+                   * exception whose `.message` is unlocalized (e.g. backend
+                   * English text, browser-native fetch errors, or an empty
+                   * string from a non-Error throw). Rendering `error.message`
+                   * directly would bypass the `t()`/`<Trans>` localization
+                   * contract that gates every user-visible string in this
+                   * component (AAP §0.8.6). The exception itself is preserved
+                   * in `error` on the hook contract so future enhancements
+                   * (e.g. structured error codes, debug-only details) can
+                   * surface specifics through additional localized strings.
+                   */}
+                  {errorGeneric}
                 </Alert>
               )}
 
