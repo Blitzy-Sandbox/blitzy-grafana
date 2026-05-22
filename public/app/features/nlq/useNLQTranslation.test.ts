@@ -758,10 +758,9 @@ describe('useNLQTranslation', () => {
     // matches the initialProps shape declared in the second argument
     // of `renderHook` — passing the full settings object so the hook
     // re-runs with the new prop on every rerender call.
-    const { result, rerender } = renderHook(
-      ({ ds }: { ds: DataSourceInstanceSettings }) => useNLQTranslation(ds),
-      { initialProps: { ds: makeDs('loki') } }
-    );
+    const { result, rerender } = renderHook(({ ds }: { ds: DataSourceInstanceSettings }) => useNLQTranslation(ds), {
+      initialProps: { ds: makeDs('loki') },
+    });
 
     // Initial state — supported datasource means the flag starts at false.
     expect(result.current.isUnsupportedDatasource).toBe(false);
@@ -803,10 +802,9 @@ describe('useNLQTranslation', () => {
   // on the next render, without any explicit `reset()` call.
   // -------------------------------------------------------------------------
   it('flips isUnsupportedDatasource to false when dsSettings.type switches from unsupported to supported', () => {
-    const { result, rerender } = renderHook(
-      ({ ds }: { ds: DataSourceInstanceSettings }) => useNLQTranslation(ds),
-      { initialProps: { ds: makeDs('grafana-testdata-datasource', 'ds-unsupported') } }
-    );
+    const { result, rerender } = renderHook(({ ds }: { ds: DataSourceInstanceSettings }) => useNLQTranslation(ds), {
+      initialProps: { ds: makeDs('grafana-testdata-datasource', 'ds-unsupported') },
+    });
 
     // Initial state — unsupported datasource means the flag starts at true.
     expect(result.current.isUnsupportedDatasource).toBe(true);

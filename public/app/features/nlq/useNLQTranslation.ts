@@ -327,8 +327,8 @@ export function useNLQTranslation(dsSettings: DataSourceInstanceSettings): UseNL
   //      This is defense-in-depth: even if a regression removed layer (2),
   //      the HTTP request is still blocked and the flag is still set
   //      before the function returns.
-  const [isUnsupportedDatasource, setIsUnsupportedDatasource] = useState<boolean>(() =>
-    !isSupportedDatasourceType(dsSettings.type)
+  const [isUnsupportedDatasource, setIsUnsupportedDatasource] = useState<boolean>(
+    () => !isSupportedDatasourceType(dsSettings.type)
   );
 
   // NLQ feature (Checkpoint 5 QA fix — AAP §0.1.1.1):
