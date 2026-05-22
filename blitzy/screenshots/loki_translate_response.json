@@ -1,0 +1,1 @@
+{"query":"{job=\"nginx\"} |= \"failed login\"","language":"logql","explanation":"Searches the nginx job stream for failed login entries","warnings":["Live schema metadata was unavailable; translation proceeded with general datasource hints."]}

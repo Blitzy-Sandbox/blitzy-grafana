@@ -1,0 +1,39 @@
+{
+  "request": {
+    "url": "http://localhost:3000/api/nlq/translate",
+    "method": "POST",
+    "headers": {
+      "content-type": "application/json",
+      "accept": "application/json, text/plain, */*",
+      "cookie_present": true,
+      "authorization_header_present": false,
+      "x-grafana-org-id": "1"
+    },
+    "body": {
+      "input": "Show me failed login attempts in the last hour grouped by IP",
+      "datasourceUid": "bfmtvck129z40c",
+      "datasourceType": "prometheus"
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "deny",
+      "x-xss-protection": "1; mode=block"
+    },
+    "body": {
+      "query": "sum by (ip) (increase(login_attempts_total{status=\"failed\"}[1h]))",
+      "language": "promql",
+      "explanation": "PromQL aggregating failed login attempts by IP using increase() over a 1-hour window.",
+      "warnings": ["Live schema metadata was unavailable; translation proceeded with general datasource hints."]
+    },
+    "security_checks": {
+      "api_key_in_body": false,
+      "stack_trace_in_body": false,
+      "secrets_in_headers": false
+    }
+  }
+}

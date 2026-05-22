@@ -34,6 +34,16 @@
 //             AAP §0.6.3.2)
 //   - Case 11 → telemetry NOT emitted on unsupported-datasource short-circuit
 //   - Case 12 → telemetry NOT emitted on empty-input short-circuit
+//   - Case 13 → criterion AAP §0.1.1.1 (Checkpoint 5 QA fix): switching
+//              `dsSettings.type` from supported to unsupported flips
+//              `isUnsupportedDatasource` to `true` on the very next render —
+//              without the user clicking Translate — so the parent bar can
+//              render the warning Alert immediately.
+//   - Case 14 → criterion AAP §0.1.1.1 (Checkpoint 5 QA fix): switching
+//              `dsSettings.type` from unsupported back to supported flips
+//              `isUnsupportedDatasource` to `false` on the next render so
+//              the input UI is restored once a supported datasource is
+//              re-selected.
 
 // Mock `@grafana/runtime` to replace ONLY the `reportInteraction` export with
 // a `jest.fn()`. All other exports (notably `setBackendSrv`, `getBackendSrv`,
@@ -716,5 +726,105 @@ describe('useNLQTranslation', () => {
     });
 
     expect(reportInteractionMock).not.toHaveBeenCalled();
+  });
+
+  // -------------------------------------------------------------------------
+  // Case 13 — isUnsupportedDatasource flips to true when `dsSettings.type`
+  //           switches from supported to unsupported mid-session
+  //
+  // Verifies the Checkpoint 5 QA fix for AAP §0.1.1.1 ("the NLQ bar MUST
+  // render a clear 'unsupported data source' message" when the active
+  // datasource is not Prometheus / Loki). Without the prop-syncing
+  // `useEffect` added by this fix, the `useState` lazy initializer fires
+  // only once at mount, so a user who opens the panel editor with Loki
+  // (supported) and then switches the datasource picker to a TestData
+  // datasource (unsupported) would continue to see the input + Translate
+  // button until they clicked Translate — only then would the runtime
+  // short-circuit inside `translate()` finally re-set the flag.
+  //
+  // This test reproduces that exact scenario at the hook layer by using
+  // `renderHook`'s `rerender` API to swap the `dsSettings` argument from
+  // supported to unsupported, and asserts that `isUnsupportedDatasource`
+  // flips to `true` synchronously on the next render — WITHOUT any
+  // `translate()` call.
+  //
+  // The lack of any registered MSW handler combined with the module-level
+  // `onUnhandledRequest: 'error'` configuration means a regression that
+  // accidentally triggered a translate() call here would fail the test
+  // loudly.
+  // -------------------------------------------------------------------------
+  it('flips isUnsupportedDatasource to true when dsSettings.type switches from supported to unsupported', () => {
+    // Start with a supported datasource. The `rerender` argument shape
+    // matches the initialProps shape declared in the second argument
+    // of `renderHook` — passing the full settings object so the hook
+    // re-runs with the new prop on every rerender call.
+    const { result, rerender } = renderHook(
+      ({ ds }: { ds: DataSourceInstanceSettings }) => useNLQTranslation(ds),
+      { initialProps: { ds: makeDs('loki') } }
+    );
+
+    // Initial state — supported datasource means the flag starts at false.
+    expect(result.current.isUnsupportedDatasource).toBe(false);
+
+    // Switch the datasource prop to an unsupported type. `rerender`
+    // synchronously re-invokes the hook with the new props; the
+    // `useEffect` keyed on `dsSettings.type` fires immediately after
+    // the new render and updates the flag.
+    rerender({ ds: makeDs('grafana-testdata-datasource', 'ds-unsupported') });
+
+    // The flag MUST have flipped to true without any Translate click.
+    // This is the load-bearing assertion for the Checkpoint 5 QA fix.
+    expect(result.current.isUnsupportedDatasource).toBe(true);
+
+    // No translation state was modified by the prop switch — the effect
+    // only touches the unsupported flag, not the query/language/explanation
+    // slices. Verifying this guards against an accidental cross-clearing
+    // regression where the effect grows into a "clear all on switch" hook.
+    expect(result.current.translatedQuery).toBe('');
+    expect(result.current.language).toBe('');
+    expect(result.current.explanation).toBe('');
+    expect(result.current.warnings).toEqual([]);
+    expect(result.current.error).toBeNull();
+    expect(result.current.isLoading).toBe(false);
+
+    // No telemetry event MUST be emitted by a prop switch — the bar
+    // tracks user-initiated interactions only (Translate / Run /
+    // Add as Panel), not parent-driven prop changes.
+    expect(reportInteractionMock).not.toHaveBeenCalled();
+  });
+
+  // -------------------------------------------------------------------------
+  // Case 14 — isUnsupportedDatasource flips back to false when
+  //           `dsSettings.type` switches from unsupported to supported
+  //
+  // Symmetric to Case 13. Verifies the reverse direction: a user who
+  // started on TestData (unsupported) and then switched to Prometheus
+  // (supported) should see the bar return to its active state immediately
+  // on the next render, without any explicit `reset()` call.
+  // -------------------------------------------------------------------------
+  it('flips isUnsupportedDatasource to false when dsSettings.type switches from unsupported to supported', () => {
+    const { result, rerender } = renderHook(
+      ({ ds }: { ds: DataSourceInstanceSettings }) => useNLQTranslation(ds),
+      { initialProps: { ds: makeDs('grafana-testdata-datasource', 'ds-unsupported') } }
+    );
+
+    // Initial state — unsupported datasource means the flag starts at true.
+    expect(result.current.isUnsupportedDatasource).toBe(true);
+
+    // Switch to a supported datasource (Prometheus). The effect synchronizes
+    // the flag immediately on the next render.
+    rerender({ ds: makeDs('prometheus', 'ds-prom') });
+
+    // The flag MUST have flipped back to false so the parent bar restores
+    // the input UI.
+    expect(result.current.isUnsupportedDatasource).toBe(false);
+
+    // No translation state was modified by the prop switch.
+    expect(result.current.translatedQuery).toBe('');
+    expect(result.current.language).toBe('');
+    expect(result.current.explanation).toBe('');
+    expect(result.current.warnings).toEqual([]);
+    expect(result.current.error).toBeNull();
+    expect(result.current.isLoading).toBe(false);
   });
 });

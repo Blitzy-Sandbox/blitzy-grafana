@@ -22,6 +22,12 @@
 //   - Criterion #9 — Unsupported datasource (e.g. MySQL) shows an
 //                    "unsupported" `<Alert>` and does NOT issue an HTTP
 //                    request
+//   - Criterion AAP §0.1.1.1 (Checkpoint 5 QA fix) — switching the
+//                    `dsSettings` prop from a supported datasource (e.g.
+//                    Loki) to an unsupported datasource (e.g. TestData)
+//                    while the bar is OPEN flips the rendered surface to
+//                    the warning Alert IMMEDIATELY, without any
+//                    Translate-button click.
 //   - Criterion #4 — Clicking "Add as Panel" invokes the `onAddPanel`
 //                    callback with the translated query
 //
@@ -505,6 +511,85 @@ describe('NaturalLanguageQueryBar', () => {
       // The MSW spy MUST NOT have been called. This is the load-bearing
       // assertion for criterion #9 — the unsupported-datasource guard
       // exists precisely to prevent wasted LLM calls.
+      expect(handlerSpy).not.toHaveBeenCalled();
+    });
+
+    // AAP §0.1.1.1 (Checkpoint 5 QA fix): When the user switches the
+    // active panel datasource from a supported type (e.g. Loki) to an
+    // unsupported type (e.g. grafana-testdata-datasource) WHILE the bar
+    // is open, the warning Alert MUST replace the input/preview UI on
+    // the very next render — without requiring the user to click
+    // Translate. The QA report's MAJOR finding (Issue #1) identified that
+    // the lazy `useState` initializer in `useNLQTranslation.ts` ran only
+    // ONCE at mount, so the unsupported-datasource state was stale after
+    // the prop changed. The `useEffect` synchronization added by this fix
+    // closes that gap; this test is the regression guard for the visual
+    // contract at the component level.
+    it('shows unsupported-datasource Alert immediately when dsSettings prop switches from supported to unsupported', async () => {
+      const handlerSpy = jest.fn();
+      server.use(
+        http.post('/api/nlq/translate', () => {
+          handlerSpy();
+          return HttpResponse.json({ query: 'should-not-be-called', language: 'promql' });
+        })
+      );
+
+      const user = userEvent.setup();
+
+      const cb = makeCallbackStubs();
+      // Start with a SUPPORTED datasource (Loki). The bar opens cleanly
+      // and shows the input UI as it would in production when the user
+      // first lands on the panel editor with Loki as their last-used DS.
+      const { rerender } = render(
+        <NaturalLanguageQueryBar
+          dsSettings={makeDsSettings('loki', 'ds-loki')}
+          panelRef={panelRefStub}
+          onRun={cb.onRun}
+          onAddPanel={cb.onAddPanel}
+        />
+      );
+
+      // Open the collapsible so the supported-state UI is mounted.
+      await user.click(screen.getByRole('button', { name: /Ask a question/i }));
+
+      // Sanity: with the supported datasource, the input + translate
+      // button render and the unsupported alert is absent.
+      expect(await screen.findByTestId('nlq-bar-input')).toBeInTheDocument();
+      expect(screen.getByTestId('nlq-bar-translate-button')).toBeInTheDocument();
+      expect(screen.queryByTestId('nlq-bar-unsupported-alert')).not.toBeInTheDocument();
+
+      // Switch the datasource prop to an UNSUPPORTED type while the bar
+      // is still open. This is the exact scenario from the QA report:
+      // the user changes the active datasource via the picker without
+      // discarding the panel.
+      rerender(
+        <NaturalLanguageQueryBar
+          dsSettings={makeDsSettings('grafana-testdata-datasource', 'ds-unsupported')}
+          panelRef={panelRefStub}
+          onRun={cb.onRun}
+          onAddPanel={cb.onAddPanel}
+        />
+      );
+
+      // The unsupported Alert MUST appear on the very next render. We use
+      // `findByTestId` so any micro-task latency from the prop-sync
+      // `useEffect` is awaited; the visual contract from AAP §0.1.1.1
+      // requires IMMEDIATE feedback, which means within one effect tick
+      // — not a long-running async settle.
+      expect(await screen.findByTestId('nlq-bar-unsupported-alert')).toBeInTheDocument();
+
+      // The input and Translate button MUST both be removed from the DOM
+      // — the bar deliberately hides the active UI for unsupported
+      // datasources to make it visually clear that no LLM call is
+      // possible.
+      expect(screen.queryByTestId('nlq-bar-input')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('nlq-bar-translate-button')).not.toBeInTheDocument();
+
+      // The MSW spy MUST NOT have been called. The whole reason the QA
+      // bug was MAJOR (not CRITICAL) is that the SECURITY contract was
+      // intact — the runtime short-circuit inside `translate()`
+      // prevented the HTTP call. This assertion confirms that contract
+      // continues to hold across the prop-sync fix.
       expect(handlerSpy).not.toHaveBeenCalled();
     });
   });

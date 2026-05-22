@@ -18,9 +18,15 @@
 //     (AAP §0.6.3.1).
 //
 // Design constraints (per AAP §0.6.1.4 and §0.8):
-//   - Uses only `useState` and `useCallback` from React. No `useEffect`,
-//     no `useReducer`, no `useMemo` — the AAP explicitly forbids them to
-//     keep the hook minimal and trivially predictable.
+//   - Uses `useState`, `useCallback`, and a single `useEffect` from React.
+//     The hook stays deliberately minimal: no `useReducer`, no `useMemo`,
+//     no caching, no debouncing. The lone `useEffect` (added per the
+//     Checkpoint 5 QA finding for AAP §0.1.1.1) synchronizes the
+//     `isUnsupportedDatasource` flag with the current `dsSettings.type`
+//     prop on every change — without it, the flag would be stale across
+//     datasource switches because `useState` lazy initializers fire only
+//     once at component mount. The runtime short-circuit inside
+//     `translate()` provides defense-in-depth on top of the effect.
 //   - Never imports `getBackendSrv` from `@grafana/runtime`. The HTTP call is
 //     delegated to `./nlqApi.postTranslate`, which isolates the runtime
 //     dependency to a single module. This keeps the hook trivially testable:
@@ -50,7 +56,7 @@
 //   - Single-turn only: each call to `translate()` is independent; the hook
 //     does NOT maintain conversation history (AAP §0.7.2.3).
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 import type { DataSourceInstanceSettings } from '@grafana/data';
 import { isFetchError, reportInteraction } from '@grafana/runtime';
@@ -231,12 +237,26 @@ export interface UseNLQTranslationResult {
    * render an `<Alert severity="warning">` with an "unsupported data source"
    * message rather than the active NL input/preview UI, per AAP §0.6.3.1.
    *
-   * Initial value is derived from the current `dsSettings.type` prop via a
-   * `useState` lazy initializer. The flag is also re-evaluated and re-set
-   * on every call to `translate()` so the runtime short-circuit always
-   * reflects the current `dsSettings.type` (and re-asserts the flag after a
-   * prior `reset()` has cleared it). `reset()` clears the flag back to
-   * `false` per the checkpoint contract.
+   * Synchronization model (three layers, defense-in-depth):
+   *   1. Initial value — derived synchronously from the current
+   *      `dsSettings.type` prop via a `useState` lazy initializer so the
+   *      flag is correct on the very first render (no flash of stale state
+   *      for unsupported datasources mounted directly).
+   *   2. Prop-change sync — a `useEffect` keyed on `dsSettings.type` keeps
+   *      the flag in lockstep with the prop after the initial render. This
+   *      is the load-bearing layer for AAP §0.1.1.1 "the NLQ bar MUST
+   *      render a clear 'unsupported data source' message" when the user
+   *      changes the active datasource mid-session (Checkpoint 5 QA fix
+   *      for the stale-state bug observed when switching from a supported
+   *      datasource to an unsupported one inside an open panel editor).
+   *   3. Runtime short-circuit — `translate()` re-checks the current
+   *      `dsSettings.type` on every invocation and re-asserts the flag
+   *      if unsupported, so the HTTP call is blocked even if a regression
+   *      removed layers (1) or (2). `reset()` clears the flag back to
+   *      `false` per the checkpoint contract; a subsequent re-render of
+   *      the hook with an unsupported `dsSettings.type` will re-assert the
+   *      flag via layer (2) on the next render, so the visual contract is
+   *      preserved even after `reset()`.
    */
   isUnsupportedDatasource: boolean;
 }
@@ -246,8 +266,11 @@ export interface UseNLQTranslationResult {
  * lifecycle for a single instance of the NLQ bar.
  *
  * Implementation notes (per AAP §0.6.1.4):
- *   - Uses only `useState` and `useCallback`. No effects, no reducers, no
- *     memos. The simplest pattern that satisfies the request/response shape.
+ *   - Uses `useState`, `useCallback`, and a single prop-synchronization
+ *     `useEffect`. No reducers, no memos. The lone effect mirrors
+ *     `dsSettings.type` into the `isUnsupportedDatasource` state slice so
+ *     the visual contract holds when the user switches the active panel
+ *     datasource at runtime (Checkpoint 5 QA fix for AAP §0.1.1.1).
  *   - Delegates the HTTP call to `postTranslate` from `./nlqApi`, which is
  *     the single point of `getBackendSrv` usage in the NLQ frontend module.
  *   - Defensively narrows the response `language` at runtime — even though
@@ -278,15 +301,60 @@ export function useNLQTranslation(dsSettings: DataSourceInstanceSettings): UseNL
   const [warnings, setWarnings] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<Error | null>(null);
-  // `isUnsupportedDatasource` is held as state (initialized lazily from the
-  // current `dsSettings.type` prop) rather than as a per-render derived
-  // value, so that `reset()` can clear it per the checkpoint contract.
-  // `translate()` re-evaluates the prop on every invocation and re-sets the
-  // flag, so the short-circuit guard remains fully enforced even after a
-  // prior `reset()` has cleared the flag.
+  // NLQ feature: `isUnsupportedDatasource` is held as state (not as a pure
+  // per-render derived value) so that `reset()` can clear it per the
+  // checkpoint contract — see Case 8 of `useNLQTranslation.test.ts`.
+  //
+  // Synchronization sources (in order of execution):
+  //
+  //   1. `useState` lazy initializer (below) seeds the flag from the
+  //      initial `dsSettings.type` prop. This guarantees the very first
+  //      render of the bar is correct even for unsupported datasources
+  //      that were active when the panel editor mounted — there is no
+  //      flash of stale "input UI" before the effect fires.
+  //
+  //   2. `useEffect` keyed on `dsSettings.type` (further below) keeps the
+  //      flag in sync after the first render. This is the load-bearing
+  //      layer for the Checkpoint 5 QA fix (AAP §0.1.1.1 "the NLQ bar
+  //      MUST render a clear 'unsupported data source' message"): when
+  //      the user switches the active datasource from supported (e.g.
+  //      Loki) to unsupported (e.g. TestData) inside an open panel
+  //      editor session, the bar MUST visually flip to the warning Alert
+  //      immediately — not only after a Translate click.
+  //
+  //   3. The runtime short-circuit inside `translate()` re-evaluates the
+  //      prop on every invocation and re-asserts the flag if unsupported.
+  //      This is defense-in-depth: even if a regression removed layer (2),
+  //      the HTTP request is still blocked and the flag is still set
+  //      before the function returns.
   const [isUnsupportedDatasource, setIsUnsupportedDatasource] = useState<boolean>(() =>
     !isSupportedDatasourceType(dsSettings.type)
   );
+
+  // NLQ feature (Checkpoint 5 QA fix — AAP §0.1.1.1):
+  //
+  // Synchronize `isUnsupportedDatasource` with `dsSettings.type` on every
+  // change. Without this effect, the `useState` lazy initializer above only
+  // runs ONCE at mount, so switching the active panel datasource from a
+  // supported type (e.g. `loki`) to an unsupported one (e.g.
+  // `grafana-testdata-datasource`) would leave the flag stale at `false`
+  // and the bar would continue to render the input/preview UI instead of
+  // the warning Alert. The Checkpoint 5 QA report identified this as a
+  // MAJOR UX-contract violation (the SECURITY contract is preserved by the
+  // runtime short-circuit inside `translate()`, but the visual contract
+  // requires immediate feedback).
+  //
+  // Dependency is `dsSettings.type` only (not the full `dsSettings`
+  // reference) so the effect skips no-op re-renders where only an
+  // unrelated field of `dsSettings` changed.
+  //
+  // The body is intentionally a single `setX` call with no cleanup
+  // function: there is nothing to tear down — we are simply mirroring a
+  // prop into state. React will skip the re-render entirely if the next
+  // value is identical to the current state (`Object.is` bail-out).
+  useEffect(() => {
+    setIsUnsupportedDatasource(!isSupportedDatasourceType(dsSettings.type));
+  }, [dsSettings.type]);
 
   /**
    * NLQ feature: clears all derived translation state.
