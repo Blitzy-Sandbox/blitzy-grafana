@@ -3217,6 +3217,19 @@
     },
     {
       "metadata": {
+        "name": "nlqEnabled",
+        "resourceVersion": "1779412677263",
+        "creationTimestamp": "2026-05-22T01:17:57Z"
+      },
+      "spec": {
+        "description": "Enable the Natural Language Query (NLQ) translation bar in the panel editor",
+        "stage": "experimental",
+        "codeowner": "@grafana/dashboards-squad",
+        "expression": "false"
+      }
+    },
+    {
+      "metadata": {
         "name": "oauthRequireSubClaim",
         "resourceVersion": "1768498862515",
         "creationTimestamp": "2024-03-25T13:22:24Z",

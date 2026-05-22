@@ -1436,4 +1436,9 @@ export interface FeatureToggles {
   * @default false
   */
   alertingMultiplePolicies?: boolean;
+  /**
+  * Enable the Natural Language Query (NLQ) translation bar in the panel editor
+  * @default false
+  */
+  nlqEnabled?: boolean;
 }

@@ -472,6 +472,29 @@ type Cfg struct {
 	// SQLExpressionTimeoutSeconds is the duration a SQL expression will run before timing out
 	SQLExpressionTimeout time.Duration
 
+	// NLQ feature: configuration fields for the Natural Language Query translation service.
+	// API key is intentionally NOT included here — it is read at runtime exclusively
+	// from os.Getenv("GF_NLQ_LLM_API_KEY") inside pkg/services/nlq/translate.go.
+	//
+	// Field semantics:
+	//   - NLQEnabled: operator kill switch enforced INSIDE pkg/services/nlq's request handler,
+	//     not at route registration. The /api/nlq/translate route is registered whenever the
+	//     nlqEnabled feature toggle is on (regardless of this field). When the toggle is on
+	//     and this field is false, every request short-circuits with HTTP 503
+	//     ErrServiceDisabled. When the toggle is off, the route is not registered at all
+	//     (HTTP 404) regardless of this field. BOTH the toggle (route + UI) and this field
+	//     (handler execution) must be enabled for the bar to be fully functional.
+	//   - NLQProvider: identifier of the LLM provider wire shape. Currently only "openai" is
+	//     fully supported. Other values fall back to OpenAI-compatible semantics with a
+	//     warning logged from readNLQSettings. Validated centrally so any future provider
+	//     branching can rely on the field being a known string.
+	//   - NLQEndpoint: the LLM chat-completions endpoint URL used by translate.go's callLLM.
+	//   - NLQModel: the LLM model identifier sent in the request body's "model" field.
+	NLQEnabled  bool
+	NLQProvider string
+	NLQEndpoint string
+	NLQModel    string
+
 	ImageUploadProvider string
 
 	// LiveMaxConnections is a maximum number of WebSocket connections to
@@ -876,6 +899,39 @@ func (cfg *Cfg) readExpressionsSettings() {
 	cfg.SQLExpressionOutputCellLimit = expressions.Key("sql_expression_output_cell_limit").MustInt64(100000)
 	cfg.SQLExpressionTimeout = expressions.Key("sql_expression_timeout").MustDuration(time.Second * 10)
 	cfg.SQLExpressionQueryLengthLimit = expressions.Key("sql_expression_query_length_limit").MustInt64(10000)
+}
+
+// NLQ feature: parse [nlq] section from defaults.ini / custom.ini.
+// Note: the LLM API key is intentionally NOT parsed here — it is sourced
+// exclusively from os.Getenv("GF_NLQ_LLM_API_KEY") at translate-time inside
+// pkg/services/nlq/translate.go to keep secrets out of ini files and logs.
+// The EnvKey convention below (GF_<SECTION>_<KEY>) automatically supports
+// GF_NLQ_ENABLED, GF_NLQ_LLM_PROVIDER, GF_NLQ_LLM_ENDPOINT, GF_NLQ_LLM_MODEL
+// as overrides for the ini-backed fields — no additional code is needed.
+//
+// Provider validation: the only fully supported provider in this release is
+// "openai" (or any OpenAI Chat Completions API compatible endpoint). Any
+// other value is preserved on the struct so future provider branching can
+// inspect it, but a warning is logged at startup so operators know the
+// configuration is being honored with OpenAI-shape semantics.
+func (cfg *Cfg) readNLQSettings() {
+	nlq := cfg.Raw.Section("nlq")
+	cfg.NLQEnabled = nlq.Key("enabled").MustBool(false)
+	cfg.NLQProvider = nlq.Key("llm_provider").MustString("openai")
+	cfg.NLQEndpoint = nlq.Key("llm_endpoint").MustString("https://api.openai.com/v1/chat/completions")
+	cfg.NLQModel = nlq.Key("llm_model").MustString("gpt-4o")
+
+	// NLQ feature: validate the configured provider. Only "openai" is fully
+	// supported in this release; other values are honored with OpenAI-shape
+	// semantics but logged so the operator sees a clear warning at startup.
+	// We only warn when the NLQ feature is enabled to avoid noise for
+	// deployments that left the [nlq] section at defaults but never opted in.
+	if cfg.NLQEnabled && cfg.NLQProvider != "openai" {
+		cfg.Logger.Warn(
+			"NLQ feature: llm_provider is not 'openai' — falling back to OpenAI-compatible request shape",
+			"configured_provider", cfg.NLQProvider,
+		)
+	}
 }
 
 type AnnotationCleanupSettings struct {
@@ -1396,6 +1452,7 @@ func (cfg *Cfg) parseINIFile(iniFile *ini.File) error {
 	cfg.readQuotaSettings()
 
 	cfg.readExpressionsSettings()
+	cfg.readNLQSettings() // NLQ feature: settings
 	if err := cfg.readGrafanaEnvironmentMetrics(); err != nil {
 		return err
 	}

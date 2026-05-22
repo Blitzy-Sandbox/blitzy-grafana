@@ -27,6 +27,7 @@ import (
 	"github.com/grafana/grafana/pkg/services/live/pushhttp"
 	"github.com/grafana/grafana/pkg/services/loginattempt/loginattemptimpl"
 	"github.com/grafana/grafana/pkg/services/ngalert"
+	"github.com/grafana/grafana/pkg/services/nlq" // NLQ feature: import to force Wire to construct *nlq.Service so its constructor side-effect (route registration) runs.
 	"github.com/grafana/grafana/pkg/services/notifications"
 	plugindashboardsservice "github.com/grafana/grafana/pkg/services/plugindashboards/service"
 	"github.com/grafana/grafana/pkg/services/pluginsintegration/angulardetectorsprovider"
@@ -80,6 +81,15 @@ func ProvideBackgroundServiceRegistry(
 	_ *grpcserver.HealthService, _ *grpcserver.ReflectionService,
 	_ *ldapapi.Service, _ *apiregistry.Service, _ auth.IDService, _ *teamapi.TeamAPI, _ ssosettings.Service,
 	_ cloudmigration.Service, _ authnimpl.Registration,
+	// NLQ feature: blank-identifier parameter forces Wire to construct *nlq.Service in the
+	// generated initializers (Initialize, InitializeForTest). The NLQ service uses
+	// constructor-time side effects to self-register POST /api/nlq/translate via
+	// routing.RouteRegister; listing nlq.ProvideService in wireBasicSet alone is insufficient
+	// because Wire prunes unconsumed providers. This follows the established Grafana pattern
+	// for side-effect-only initialization, identical to the _ dashboardsnapshots.Service /
+	// _ teamapi.TeamAPI / _ cloudmigration.Service entries above. The value is intentionally
+	// discarded; this function does not invoke any *nlq.Service method.
+	_ *nlq.Service,
 ) *BackgroundServiceRegistry {
 	return NewBackgroundServiceRegistry(
 		httpServer,

@@ -1,0 +1,1 @@
+{"query":"sum(rate(http_requests_total[5m])) by (handler)","language":"promql","explanation":"Computes the per-handler request rate over a 5-minute window","warnings":["Live schema metadata was unavailable; translation proceeded with general datasource hints."]}
