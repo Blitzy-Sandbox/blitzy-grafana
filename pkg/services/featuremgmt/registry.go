@@ -2268,6 +2268,15 @@ var (
 			HideFromDocs: true,
 			Expression:   "false",
 		},
+		// NLQ feature: feature flag toggle
+		{
+			Name:         "nlqEnabled",
+			Description:  "Enable the Natural Language Query (NLQ) translation bar in the panel editor",
+			Stage:        FeatureStageExperimental,
+			FrontendOnly: false,
+			Owner:        grafanaDashboardsSquad,
+			Expression:   "false",
+		},
 	}
 )
 

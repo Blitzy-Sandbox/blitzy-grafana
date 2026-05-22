@@ -793,4 +793,8 @@ const (
 	// FlagAlertingMultiplePolicies
 	// Enables the ability to create multiple alerting policies
 	FlagAlertingMultiplePolicies = "alertingMultiplePolicies"
+
+	// FlagNlqEnabled
+	// Enable the Natural Language Query (NLQ) translation bar in the panel editor
+	FlagNlqEnabled = "nlqEnabled"
 )
