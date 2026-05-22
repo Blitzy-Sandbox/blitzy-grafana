@@ -10,6 +10,12 @@
 //     the response, attach warnings.
 //   - buildPrompt, callLLM, parseResponse are unexported helpers
 //     scoped to this file.
+//   - safeHost is a package-private free helper that strips a URL
+//     down to its host component for safe inclusion in log lines.
+//     Every log call in this file that references the configured
+//     LLM endpoint MUST route the value through safeHost so that
+//     accidentally embedded credentials in the URL (a misconfiguration
+//     pattern) never reach the log stream.
 //
 // The LLM call uses ONLY the Go standard library net/http per AAP
 // §0.2.1 ("Use standard net/http: backend LLM calls use Go standard
@@ -42,6 +48,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -183,12 +190,22 @@ func (s *Service) PostTranslate(c *contextmodel.ReqContext) response.Response {
 // declared in models.go are recognised; any unrecognised error is
 // reported as 500 Internal Server Error with a generic message.
 //
-// SECURITY: the error message passed to response.Error is the
-// canonical sentinel string — never the underlying err.Error()
+// SECURITY (AAP §0.8.5): the error message passed to response.Error
+// is the canonical sentinel string — never the underlying err.Error()
 // content — to prevent accidental leakage of API key fragments,
 // prompt content, or request body content into response bodies.
 // Grafana's response.Error includes the underlying error in the
-// server log but not the client-facing JSON body.
+// server log (via resp.err) but not the client-facing JSON body.
+//
+// Special-case for ErrMissingAPIKey: a nil underlying error is
+// passed so that NO portion of any future wrapped error message
+// could ever reach the response object — and an explicit
+// s.log.Error call is issued with a fully hardcoded safe message
+// so the operator still sees an actionable log line. The current
+// ErrMissingAPIKey sentinel only mentions the env-var NAME (not
+// its value, which is empty by definition when this error fires),
+// but the nil-passing pattern survives any future refactor that
+// might wrap additional context into the sentinel.
 func (s *Service) errorResponse(err error) response.Response {
 	switch {
 	case errors.Is(err, ErrEmptyInput):
@@ -199,7 +216,17 @@ func (s *Service) errorResponse(err error) response.Response {
 		// 500 (not 401/403) because this is an operator
 		// misconfiguration, not a caller problem. The caller
 		// cannot fix it; the operator must set GF_NLQ_LLM_API_KEY.
-		return response.Error(http.StatusInternalServerError, "NLQ LLM provider is not configured", err)
+		//
+		// NLQ feature security (AAP §0.8.5): log explicitly with
+		// a hardcoded string and pass nil to response.Error so
+		// no key-related context can ever reach the response
+		// object's stored err. The "error" field below is a
+		// hardcoded string, NOT the value of the env var.
+		s.log.Error(
+			"NLQ feature: LLM API key is not configured",
+			"error", "GF_NLQ_LLM_API_KEY not set",
+		)
+		return response.Error(http.StatusInternalServerError, "NLQ LLM provider is not configured", nil)
 	case errors.Is(err, ErrLLMUnavailable):
 		// 502 Bad Gateway because the immediate failure is in an
 		// upstream service (the LLM provider), not in Grafana.
@@ -434,11 +461,14 @@ func (s *Service) callLLM(ctx context.Context, systemPrompt, userPrompt string) 
 	// returned error.
 	httpResp, err := s.httpClient.Do(httpReq)
 	if err != nil {
-		// SECURITY: only the endpoint URL (configuration, not
-		// secret) and the error class are logged; the prompts and
-		// API key are NEVER part of the log line.
-		s.log.Warn("NLQ feature: LLM call transport failure",
-			"endpoint", s.cfg.NLQEndpoint,
+		// SECURITY (AAP §0.8.5): only the URL host (NOT the full
+		// URL, which could in pathological cases contain embedded
+		// credentials) and the error class are logged. The prompts
+		// and API key are NEVER part of the log line. The configured
+		// model name is non-secret operator configuration.
+		s.log.Error("NLQ feature: LLM call transport failure",
+			"host", safeHost(s.cfg.NLQEndpoint),
+			"model", s.cfg.NLQModel,
 			"err", err,
 		)
 		return nil, fmt.Errorf("%w: %v", ErrLLMUnavailable, err)
@@ -457,8 +487,9 @@ func (s *Service) callLLM(ctx context.Context, systemPrompt, userPrompt string) 
 	const maxResponseBytes = 1 << 20 // 1 MiB
 	respBytes, err := io.ReadAll(io.LimitReader(httpResp.Body, maxResponseBytes))
 	if err != nil {
-		s.log.Warn("NLQ feature: LLM response read failure",
-			"endpoint", s.cfg.NLQEndpoint,
+		s.log.Error("NLQ feature: LLM response read failure",
+			"host", safeHost(s.cfg.NLQEndpoint),
+			"model", s.cfg.NLQModel,
 			"status", httpResp.StatusCode,
 			"err", err,
 		)
@@ -469,9 +500,17 @@ func (s *Service) callLLM(ctx context.Context, systemPrompt, userPrompt string) 
 	// transport-level failure; the body is discarded for the
 	// purposes of error reporting (it may contain provider-
 	// internal diagnostic content not safe for the client).
+	//
+	// CRITICAL (AAP §0.8.5): DO NOT include respBytes in the
+	// returned error or in the log line. The body may in
+	// unusual edge cases echo back portions of the request,
+	// which could inadvertently include the prompt or be
+	// misinterpreted as containing sensitive data. We log only
+	// the status code, host, and configured model.
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		s.log.Warn("NLQ feature: LLM non-2xx response",
-			"endpoint", s.cfg.NLQEndpoint,
+		s.log.Error("NLQ feature: LLM non-2xx response",
+			"host", safeHost(s.cfg.NLQEndpoint),
+			"model", s.cfg.NLQModel,
 			"status", httpResp.StatusCode,
 		)
 		return nil, fmt.Errorf("%w: HTTP %d", ErrLLMUnavailable, httpResp.StatusCode)
@@ -541,7 +580,9 @@ func (s *Service) parseResponse(body []byte) (parsedQuery, error) {
 // parseResponse surfaces the canonical error.
 //
 // The function returns the original string unchanged if no fences
-// are detected.
+// are detected. strings.HasSuffix is used as an explicit guard
+// around the closing fence trim so the function reads symmetrically
+// (HasPrefix on entry, HasSuffix before the final TrimSuffix).
 func stripCodeFences(s string) string {
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, "```") {
@@ -553,13 +594,50 @@ func stripCodeFences(s string) string {
 	idx := strings.IndexByte(s, '\n')
 	if idx == -1 {
 		// Pathological: a single-line ``` something``` with no
-		// newline. Strip the prefix only.
+		// newline. Strip the prefix only, then attempt a closing
+		// fence trim on whatever remains.
 		s = strings.TrimPrefix(s, "```")
-		return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(s), "```"))
+		s = strings.TrimSpace(s)
+		if strings.HasSuffix(s, "```") {
+			s = strings.TrimSuffix(s, "```")
+		}
+		return strings.TrimSpace(s)
 	}
 	s = s[idx+1:]
 	// Strip the closing fence, tolerating trailing whitespace.
 	s = strings.TrimSpace(s)
-	s = strings.TrimSuffix(s, "```")
+	if strings.HasSuffix(s, "```") {
+		s = strings.TrimSuffix(s, "```")
+	}
 	return strings.TrimSpace(s)
+}
+
+// safeHost returns just the host portion of a URL, suitable for
+// safe inclusion in log lines. It strips the scheme, path, query,
+// fragment, and — critically — any userinfo (username:password)
+// component that an operator might have embedded in the configured
+// LLM endpoint. This is a defense-in-depth measure: the canonical
+// NLQ deployment passes secrets via GF_NLQ_LLM_API_KEY rather than
+// in the URL, but a future operator who configures a self-hosted
+// LLM with HTTP basic auth could inadvertently include credentials
+// in NLQEndpoint. Logging only u.Host guarantees those credentials
+// never reach the log stream.
+//
+// Returns "<invalid-endpoint>" if the URL fails to parse or has an
+// empty host. This sentinel is deliberately distinct from the empty
+// string so a log scraper grep for empty endpoints does not match
+// it accidentally.
+//
+// Security invariant (AAP §0.8.5): every log call in this file that
+// references s.cfg.NLQEndpoint MUST route the value through
+// safeHost. The constant set of log call-sites is small (callLLM
+// only); reviewers can verify this invariant by grepping for
+// 's.cfg.NLQEndpoint' in this file and confirming each match is
+// wrapped in safeHost(...).
+func safeHost(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return "<invalid-endpoint>"
+	}
+	return u.Host
 }
