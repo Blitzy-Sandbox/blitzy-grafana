@@ -472,6 +472,14 @@ type Cfg struct {
 	// SQLExpressionTimeoutSeconds is the duration a SQL expression will run before timing out
 	SQLExpressionTimeout time.Duration
 
+	// NLQ feature: configuration fields for the Natural Language Query translation service.
+	// API key is intentionally NOT included here — it is read at runtime exclusively
+	// from os.Getenv("GF_NLQ_LLM_API_KEY") inside pkg/services/nlq/translate.go.
+	NLQEnabled  bool
+	NLQProvider string
+	NLQEndpoint string
+	NLQModel    string
+
 	ImageUploadProvider string
 
 	// LiveMaxConnections is a maximum number of WebSocket connections to
@@ -876,6 +884,21 @@ func (cfg *Cfg) readExpressionsSettings() {
 	cfg.SQLExpressionOutputCellLimit = expressions.Key("sql_expression_output_cell_limit").MustInt64(100000)
 	cfg.SQLExpressionTimeout = expressions.Key("sql_expression_timeout").MustDuration(time.Second * 10)
 	cfg.SQLExpressionQueryLengthLimit = expressions.Key("sql_expression_query_length_limit").MustInt64(10000)
+}
+
+// NLQ feature: parse [nlq] section from defaults.ini / custom.ini.
+// Note: the LLM API key is intentionally NOT parsed here — it is sourced
+// exclusively from os.Getenv("GF_NLQ_LLM_API_KEY") at translate-time inside
+// pkg/services/nlq/translate.go to keep secrets out of ini files and logs.
+// The EnvKey convention below (GF_<SECTION>_<KEY>) automatically supports
+// GF_NLQ_ENABLED, GF_NLQ_LLM_PROVIDER, GF_NLQ_LLM_ENDPOINT, GF_NLQ_LLM_MODEL
+// as overrides for the ini-backed fields — no additional code is needed.
+func (cfg *Cfg) readNLQSettings() {
+	nlq := cfg.Raw.Section("nlq")
+	cfg.NLQEnabled = nlq.Key("enabled").MustBool(false)
+	cfg.NLQProvider = nlq.Key("llm_provider").MustString("openai")
+	cfg.NLQEndpoint = nlq.Key("llm_endpoint").MustString("https://api.openai.com/v1/chat/completions")
+	cfg.NLQModel = nlq.Key("llm_model").MustString("gpt-4o")
 }
 
 type AnnotationCleanupSettings struct {
@@ -1396,6 +1419,7 @@ func (cfg *Cfg) parseINIFile(iniFile *ini.File) error {
 	cfg.readQuotaSettings()
 
 	cfg.readExpressionsSettings()
+	cfg.readNLQSettings() // NLQ feature: settings
 	if err := cfg.readGrafanaEnvironmentMetrics(); err != nil {
 		return err
 	}
