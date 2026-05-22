@@ -25,11 +25,22 @@
 //     no hardcoded colors, spacings, radii, or shadows in this file.
 
 import { css } from '@emotion/css';
-import { useMemo } from 'react';
+import { useCallback, useMemo } from 'react';
 
 import { GrafanaTheme2 } from '@grafana/data';
 import { Trans, t } from '@grafana/i18n';
-import { Button, CodeEditor, Stack, Text, useStyles2, useTheme2 } from '@grafana/ui';
+import { Button, CodeEditor, type Monaco, Stack, Text, useStyles2, useTheme2 } from '@grafana/ui';
+
+// NLQ feature Checkpoint 6 QA fix (MAJOR Issue 1 — PromQL/LogQL Monaco
+// language lazy-registers, preview shows plaintext on first translation).
+// `ensureNLQLanguageRegistered` synchronously registers the language ID
+// with Monaco BEFORE the editor's model is created (via the
+// `onBeforeEditorMount` callback wired below) and asynchronously installs
+// the Monarch tokenizer + language configuration so the first NLQ
+// translation renders with syntax highlighting — regardless of whether
+// the user has previously opened the Prometheus/Loki query editor's
+// "Code" mode. See `./monacoLanguages.ts` for the full design rationale.
+import { ensureNLQLanguageRegistered } from './monacoLanguages';
 
 /**
  * NLQ feature: props consumed by {@link NLQQueryPreview}.
@@ -55,9 +66,13 @@ export interface NLQQueryPreviewProps {
    * - `'promql'` when the active datasource is `prometheus` (or Mimir).
    * - `'logql'` when the active datasource is `loki`.
    *
-   * Both languages are pre-registered globally by Grafana's Monaco setup
-   * (see `PromQueryCodeEditor.tsx` and `LokiQueryCodeEditor.tsx`); no
-   * additional language registration is required here.
+   * Both languages are registered with Monaco by the `onBeforeEditorMount`
+   * callback wired below — see `./monacoLanguages.ts` for the registration
+   * helpers and the Checkpoint 6 QA fix rationale (Issue 1, MAJOR). Prior
+   * to that fix, the preview rendered as plaintext on first translation
+   * because Grafana lazy-registers PromQL/LogQL inside the Prometheus and
+   * Loki query-editor MonacoQueryField components (which only mount when
+   * the user opens "Code" mode in those editors).
    */
   language: 'promql' | 'logql';
 
@@ -174,15 +189,36 @@ export function NLQQueryPreview({
   // (matching the `monacoOptions` memoization rationale above) so the
   // editor does not see height-prop identity churn that could trigger
   // unnecessary internal reflow.
-  const editorHeightPx = useMemo(
-    () => parseCssLengthToPx(theme.spacing(15), 120),
-    [theme]
-  );
+  const editorHeightPx = useMemo(() => parseCssLengthToPx(theme.spacing(15), 120), [theme]);
 
   // Pre-compute the editor's accessible label so the string flows through the
   // i18n pipeline (Crowdin) exactly once per render, and so the value is
   // stable across re-renders for the same locale.
   const editorAriaLabel = t('nlq.preview.editor-aria-label', 'Generated query editor');
+
+  // NLQ feature Checkpoint 6 QA fix (MAJOR Issue 1):
+  //
+  // `onBeforeEditorMount` is fired by the `CodeEditor` after Monaco has been
+  // loaded but BEFORE the underlying editor and model are created. This is
+  // the canonical hook for registering custom languages so that the model
+  // created with `language: 'promql' | 'logql'` is immediately recognised by
+  // Monaco rather than falling back to the plaintext tokenizer.
+  //
+  // The registration is idempotent: `ensureNLQLanguageRegistered` (see
+  // `./monacoLanguages.ts`) guards each language behind a module-scoped flag
+  // so re-mounting the preview many times within one page session pays the
+  // setup cost at most once per language.
+  //
+  // We memoize on `language` so the callback identity is stable across
+  // re-renders that do not change the language prop — preventing
+  // `CodeEditor` from observing a fresh function on every render (which
+  // some Monaco-React wrappers treat as a configuration change).
+  const handleBeforeEditorMount = useCallback(
+    (monaco: Monaco) => {
+      ensureNLQLanguageRegistered(monaco, language);
+    },
+    [language]
+  );
 
   return (
     <div className={styles.container} data-testid="nlq-query-preview">
@@ -212,6 +248,13 @@ export function NLQQueryPreview({
             height={editorHeightPx}
             showMiniMap={false}
             showLineNumbers={true}
+            // NLQ feature Checkpoint 6 QA fix (MAJOR Issue 1): register the
+            // PromQL / LogQL Monaco language BEFORE the editor's model is
+            // created so the first translation shows proper syntax
+            // highlighting rather than plaintext. See
+            // `handleBeforeEditorMount` above and `./monacoLanguages.ts`
+            // for the full rationale.
+            onBeforeEditorMount={handleBeforeEditorMount}
             // Both onBlur AND onSave wire to the same onChange callback so
             // edits propagate whether the user clicks away from the editor
             // or hits Cmd/Ctrl+S inside it (per AAP §0.6.1.4 validation
@@ -228,7 +271,20 @@ export function NLQQueryPreview({
           </Text>
         )}
 
-        <Stack direction="row" gap={1} alignItems="center">
+        {/*
+          NLQ feature Checkpoint 6 QA fix (MINOR Issue 3 — Run + Add as
+          Panel button row overflows at sub-800px viewports).
+          `wrap` allows the Add-as-Panel button to flow onto a second row
+          when the bar is narrower than the buttons' natural width
+          (observed at viewports < ~800px, e.g. mobile portrait at 480px).
+          At realistic ≥960px panel-editor sidebar widths the two buttons
+          fit on one row and the layout is visually identical to the
+          pre-fix appearance — `wrap` is a no-op when the container has
+          room. Per `Stack.tsx:L18`, the `wrap` prop maps to CSS
+          `flex-wrap: wrap` so the design-system contract is preserved
+          (no raw flex CSS introduced).
+        */}
+        <Stack direction="row" gap={1} alignItems="center" wrap="wrap">
           <Button variant="primary" onClick={onRun} icon="play">
             <Trans i18nKey="nlq.preview.run-button">Run</Trans>
           </Button>

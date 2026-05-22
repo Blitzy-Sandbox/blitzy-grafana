@@ -45,6 +45,22 @@ const NLQ_TRANSLATE_ENDPOINT = '/api/nlq/translate';
  * does NOT swallow errors, log payloads to the console, retry, or apply any
  * resilience pattern (per AAP §0.8.1 minimal-change clause).
  *
+ * NLQ feature Checkpoint 6 QA fix (MINOR Issue 2): the third
+ * `{ showErrorAlert: false }` argument suppresses Grafana's default
+ * automatic backend-error toast. Without this option, a backend error
+ * triggers TWO error surfaces simultaneously: the in-bar localized
+ * `<Alert>` (rendered by `NaturalLanguageQueryBar` via the localized
+ * `t('nlq.error.generic', ...)` string) AND a top-of-page toast carrying
+ * the un-localized backend error string. Per AAP §0.8.6 ("All user-visible
+ * strings MUST be wrapped in `t()` from `@grafana/i18n`"), the
+ * un-localized toast violates the i18n contract. The
+ * `showErrorAlert: false` option opts THIS endpoint out of the toast and
+ * leaves the localized `<Alert>` as the single source of truth for user-
+ * facing error messaging. This matches the canonical pattern used
+ * throughout the codebase for endpoints whose callers render their own
+ * localized error UI (e.g. `public/app/features/datasources/api.ts:L17,L37`,
+ * `public/app/features/alerting/unified/api/alertmanager.ts`).
+ *
  * @param req - the translation request DTO mirroring the Go `TranslateRequest`
  *   struct in `pkg/services/nlq/models.go`. The server validates that
  *   `input` is non-empty and that `datasourceType` is in the supported set
@@ -53,8 +69,14 @@ const NLQ_TRANSLATE_ENDPOINT = '/api/nlq/translate';
  *   `NLQQueryPreview` Monaco editor and any non-fatal warnings collected
  *   during schema-context fetching.
  * @throws rejects with the underlying `getBackendSrv()` error if the backend
- *   responds with a non-2xx status or the network call fails.
+ *   responds with a non-2xx status or the network call fails. The error
+ *   still propagates as a rejected promise so `useNLQTranslation` can
+ *   capture it into the hook's `error` state and surface the localized
+ *   in-bar Alert — only the AUTOMATIC backend toast is suppressed.
  */
 export async function postTranslate(req: TranslateRequest): Promise<TranslateResponse> {
-  return getBackendSrv().post<TranslateResponse>(NLQ_TRANSLATE_ENDPOINT, req);
+  return getBackendSrv().post<TranslateResponse>(NLQ_TRANSLATE_ENDPOINT, req, {
+    // NLQ feature Checkpoint 6 QA fix (MINOR Issue 2): see JSDoc above.
+    showErrorAlert: false,
+  });
 }
