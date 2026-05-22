@@ -95,22 +95,28 @@ export interface NaturalLanguageQueryBarProps {
   panelRef: SceneObjectRef<VizPanel>;
 
   /**
-   * Optional callback fired when the user clicks "Add as Panel" inside the
+   * REQUIRED callback fired when the user clicks "Add as Panel" inside the
    * `NLQQueryPreview`. Receives the (possibly user-edited) translated query
    * string and the resolved query-language identifier.
    *
-   * If not provided, the bar simply emits the telemetry event and otherwise
-   * no-ops — the consumer is expected to wire the actual scene-side panel
-   * creation flow as needed. This keeps the component trivially testable:
-   * tests inject a `jest.fn()` and assert the call.
+   * Marked required per Checkpoint 4 review feedback (C1 / C3): the previous
+   * optional-with-no-op behavior caused the panel-editor integration to
+   * silently no-op when the production call site at
+   * `PanelDataQueriesTab.tsx` neglected to pass a callback. Making the
+   * callback required forces every consumer — including future call sites
+   * and tests — to wire a real handler, eliminating the "translates but
+   * does nothing" UX failure flagged in the review.
+   *
+   * Tests inject a `jest.fn()` and assert the call.
    */
-  onAddPanel?: (query: string, language: 'promql' | 'logql') => void;
+  onAddPanel: (query: string, language: 'promql' | 'logql') => void;
 
   /**
-   * Optional callback fired when the user clicks "Run" inside the
-   * `NLQQueryPreview`. Same shape and semantics as `onAddPanel`.
+   * REQUIRED callback fired when the user clicks "Run" inside the
+   * `NLQQueryPreview`. Same shape and semantics as `onAddPanel`. See
+   * `onAddPanel`'s JSDoc for the rationale on required (vs. optional).
    */
-  onRun?: (query: string, language: 'promql' | 'logql') => void;
+  onRun: (query: string, language: 'promql' | 'logql') => void;
 }
 
 /**
@@ -177,14 +183,15 @@ export function NaturalLanguageQueryBar({
  * the inner component owns the hook lifecycle.
  *
  * `panelRef` is intentionally omitted from the inner props — the bar's
- * actual behavior is driven entirely by `dsSettings` plus the two optional
+ * actual behavior is driven entirely by `dsSettings` plus the two required
  * callbacks. The outer component carries `panelRef` purely for typing /
  * call-site self-documentation.
  */
 interface NaturalLanguageQueryBarInnerProps {
   dsSettings: DataSourceInstanceSettings;
-  onAddPanel?: (query: string, language: 'promql' | 'logql') => void;
-  onRun?: (query: string, language: 'promql' | 'logql') => void;
+  // NLQ feature: both callbacks are required (see outer `NaturalLanguageQueryBarProps`).
+  onAddPanel: (query: string, language: 'promql' | 'logql') => void;
+  onRun: (query: string, language: 'promql' | 'logql') => void;
 }
 
 function NaturalLanguageQueryBarInner({ dsSettings, onAddPanel, onRun }: NaturalLanguageQueryBarInnerProps) {
@@ -270,7 +277,7 @@ function NaturalLanguageQueryBarInner({ dsSettings, onAddPanel, onRun }: Natural
    * the original `translatedQuery` so analytics can measure how often the
    * LLM's output is accepted unchanged.
    *
-   * The narrowing on `language` ensures the optional callback is only
+   * The narrowing on `language` ensures the required callback is only
    * invoked with the well-known supported set; an unexpected language
    * value (which would only occur if the server misbehaved) is silently
    * ignored rather than propagated to the parent.
@@ -280,8 +287,12 @@ function NaturalLanguageQueryBarInner({ dsSettings, onAddPanel, onRun }: Natural
       dsType: dsSettings.type,
       edited: editedQuery !== translatedQuery,
     });
+    // NLQ feature: `onRun` is REQUIRED (no optional chaining) — see
+    // `NaturalLanguageQueryBarProps.onRun` JSDoc. The `if` below narrows
+    // `language` from string to the 'promql' | 'logql' literal union
+    // expected by the callback's type signature.
     if (language === 'promql' || language === 'logql') {
-      onRun?.(editedQuery, language);
+      onRun(editedQuery, language);
     }
   }, [onRun, editedQuery, translatedQuery, language, dsSettings.type]);
 
@@ -291,8 +302,10 @@ function NaturalLanguageQueryBarInner({ dsSettings, onAddPanel, onRun }: Natural
    */
   const handleAddPanel = useCallback(() => {
     reportInteraction('grafana_nlq_add_panel_clicked', { dsType: dsSettings.type });
+    // NLQ feature: `onAddPanel` is REQUIRED (no optional chaining) — see
+    // `NaturalLanguageQueryBarProps.onAddPanel` JSDoc.
     if (language === 'promql' || language === 'logql') {
-      onAddPanel?.(editedQuery, language);
+      onAddPanel(editedQuery, language);
     }
   }, [onAddPanel, editedQuery, language, dsSettings.type]);
 

@@ -66,6 +66,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -77,11 +78,14 @@ import (
 	"time"
 
 	gokitlog "github.com/go-kit/log"
+	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/grafana/grafana/pkg/api/routing"
+	"github.com/grafana/grafana/pkg/apimachinery/identity"
 	"github.com/grafana/grafana/pkg/infra/log"
+	pluginfakes "github.com/grafana/grafana/pkg/plugins/manager/pluginfakes"
 	"github.com/grafana/grafana/pkg/services/accesscontrol/actest"
 	contextmodel "github.com/grafana/grafana/pkg/services/contexthandler/model"
 	"github.com/grafana/grafana/pkg/services/datasources"
@@ -99,6 +103,46 @@ import (
 	"github.com/grafana/grafana/pkg/setting"
 	"github.com/grafana/grafana/pkg/web"
 )
+
+// fakePluginContextProvider is a lightweight stand-in for
+// *plugincontext.Provider used by the NLQ schema-fetch tests. The
+// production type carries a substantial dependency chain
+// (pluginstore, cache service, datasource cache, plugin settings,
+// secrets) that is irrelevant to the NLQ service contract; the
+// fake constructs a minimal backend.PluginContext envelope that
+// the FakePluginClient's CallResourceHandlerFunc can consume.
+//
+// Tests that want the live schema fetch to SOFT-fail set
+// CallResourceErr on the fake plugin client (the typical pattern,
+// since most tests assert the Warnings entry that arises from a
+// soft failure).
+type fakePluginContextProvider struct {
+	err error
+}
+
+func (f *fakePluginContextProvider) GetWithDataSource(_ context.Context, pluginID string, _ identity.Requester, ds *datasources.DataSource) (backend.PluginContext, error) {
+	if f.err != nil {
+		return backend.PluginContext{}, f.err
+	}
+	ctxOrgID := int64(0)
+	if ds != nil {
+		ctxOrgID = ds.OrgID
+	}
+	return backend.PluginContext{
+		OrgID:    ctxOrgID,
+		PluginID: pluginID,
+	}, nil
+}
+
+// failingCallResourceFunc is the default plugin-client behavior in
+// tests: every CallResource invocation returns a transport error so
+// fetchLiveSchema downgrades to a SOFT failure and Translate attaches
+// the Warnings entry that the happy-path tests rely on. Tests that
+// want a different outcome (e.g. a 2xx response with canned label
+// names) construct their own FakePluginClient instead.
+var failingCallResourceFunc = backend.CallResourceHandlerFunc(func(_ context.Context, _ *backend.CallResourceRequest, _ backend.CallResourceResponseSender) error {
+	return errors.New("synthetic plugin transport failure")
+})
 
 // testAPIKey is a fixed-value placeholder API key used by every
 // test that needs GF_NLQ_LLM_API_KEY to be set to a non-empty value.
@@ -174,9 +218,11 @@ func seedDataSources() *dsfakes.FakeDataSourceService {
 // configured for the test).
 //
 // Default fakes:
-//   - cfg.NLQEnabled       = true (so route registration runs if a
-//     test exercises it; tests that call
-//     Translate directly bypass the gate).
+//   - cfg.NLQEnabled       = true (so the new ErrServiceDisabled
+//     short-circuit in Translate does NOT
+//     fire; tests that want to exercise
+//     that path override cfg.NLQEnabled
+//     to false).
 //   - cfg.NLQProvider      = "openai"
 //   - cfg.NLQEndpoint      = llmEndpoint (from the caller).
 //   - cfg.NLQModel         = "gpt-4o-test"
@@ -190,10 +236,19 @@ func seedDataSources() *dsfakes.FakeDataSourceService {
 //     (a short timeout sufficient for
 //     httptest local connections; production
 //     uses 30s via llmHTTPTimeout).
+//   - pluginClient          = FakePluginClient configured to fail
+//     every CallResource invocation (so
+//     the live schema fetch SOFT-fails and
+//     the happy-path tests observe the
+//     expected Warnings entry).
+//   - pluginContext         = fakePluginContextProvider returning a
+//     minimal envelope; the FakePluginClient
+//     above never inspects it.
 //
 // Tests that need different behavior (e.g., a fake dsService with
-// no datasources, or a denying access control) override the
-// relevant field on the returned *Service.
+// no datasources, a denying access control, or a CallResource
+// that succeeds with canned data) override the relevant field on
+// the returned *Service.
 func newTestService(t *testing.T, llmEndpoint string) *Service {
 	t.Helper()
 
@@ -211,6 +266,16 @@ func newTestService(t *testing.T, llmEndpoint string) *Service {
 		features:      featuremgmt.WithFeatures(featuremgmt.FlagNlqEnabled),
 		log:           log.New("test.nlq"),
 		httpClient:    &http.Client{Timeout: 5 * time.Second},
+		// NLQ feature MAJOR fix (review feedback — CallResource
+		// integration): default plugin client fails CallResource
+		// so the happy-path tests observe the SOFT-fail Warnings
+		// behavior that previously came from the unreachable URL
+		// in seedDataSources. Tests that want a 2xx fetch construct
+		// their own FakePluginClient locally.
+		pluginClient: &pluginfakes.FakePluginClient{
+			CallResourceHandlerFunc: failingCallResourceFunc,
+		},
+		pluginContext: &fakePluginContextProvider{},
 	}
 }
 
@@ -231,25 +296,22 @@ func TestProvideService_ConstructsWithoutError(t *testing.T) {
 	dsService := &dsfakes.FakeDataSourceService{}
 	accessControl := actest.FakeAccessControl{ExpectedEvaluate: true}
 	features := featuremgmt.WithFeatures()
+	pluginClient := &pluginfakes.FakePluginClient{CallResourceHandlerFunc: failingCallResourceFunc}
 
-	svc, err := ProvideService(cfg, rr, dsService, accessControl, features)
+	svc, err := ProvideService(cfg, rr, dsService, accessControl, features, pluginClient, nil)
 	require.NoError(t, err, "ProvideService must not return an error when the feature flag is off")
 	require.NotNil(t, svc, "ProvideService must return a non-nil *Service even when the feature flag is off")
 }
 
-// TestProvideService_DualGate_CfgEnabledFlagOff_DoesNotRegister
-// covers the NLQ feature MINOR review finding (defaults.ini L2304
-// + service.go L224-225). The contract is: BOTH cfg.NLQEnabled AND
-// the nlqEnabled feature toggle must be enabled for the route to
-// be live. When either gate is closed, registerAPIEndpoints must
-// NOT be called.
-//
-// MECHANICS: build a Service via ProvideService with cfg enabled
-// but the feature toggle disabled, then inspect the route register
-// for the absence of POST /api/nlq/translate.
-func TestProvideService_DualGate_CfgEnabledFlagOff_DoesNotRegister(t *testing.T) {
+// TestProvideService_FlagOff_DoesNotRegister covers one leg of the
+// post-harmonization gate contract (NLQ feature MAJOR review
+// finding — feature gate harmonization). With the nlqEnabled
+// feature toggle OFF, the route MUST NOT be mounted regardless of
+// the value of cfg.NLQEnabled. This makes the server byte-equivalent
+// to baseline Grafana when the toggle is off.
+func TestProvideService_FlagOff_DoesNotRegister(t *testing.T) {
 	cfg := setting.NewCfg()
-	cfg.NLQEnabled = true
+	cfg.NLQEnabled = true // cfg ON, but flag OFF — route MUST NOT register
 	cfg.NLQEndpoint = "https://example.invalid"
 
 	rr := routing.NewRouteRegister()
@@ -261,22 +323,30 @@ func TestProvideService_DualGate_CfgEnabledFlagOff_DoesNotRegister(t *testing.T)
 		&dsfakes.FakeDataSourceService{},
 		actest.FakeAccessControl{ExpectedEvaluate: true},
 		features,
+		&pluginfakes.FakePluginClient{CallResourceHandlerFunc: failingCallResourceFunc},
+		nil,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, svc)
 
 	// Inspect routes for the absence of /api/nlq/translate.
 	require.False(t, routeRegistered(rr, "POST", "/api/nlq/translate"),
-		"route MUST NOT be registered when nlqEnabled feature flag is off, even if cfg.NLQEnabled is true")
+		"route MUST NOT be registered when the nlqEnabled feature toggle is off, even if cfg.NLQEnabled is true")
 }
 
-// TestProvideService_DualGate_FlagOnCfgOff_DoesNotRegister covers
-// the reciprocal of the previous test — the second leg of the dual
-// gate. cfg.NLQEnabled=false MUST keep the route off even if the
-// feature toggle is enabled.
-func TestProvideService_DualGate_FlagOnCfgOff_DoesNotRegister(t *testing.T) {
+// TestProvideService_FlagOnCfgOff_RegistersRoute_AndHandlerReturnsServiceDisabled
+// covers the harmonized-gate behavior introduced to address the
+// MAJOR review finding (feature gate harmonization). When the
+// feature toggle is ON but cfg.NLQEnabled is OFF, the route MUST
+// be registered (so the frontend never sees a 404 when its
+// nlqEnabled-gated bar is visible), and the handler MUST short-
+// circuit with ErrServiceDisabled (HTTP 503) instead of doing any
+// schema fetch or LLM work.
+func TestProvideService_FlagOnCfgOff_RegistersRoute_AndHandlerReturnsServiceDisabled(t *testing.T) {
+	t.Setenv("GF_NLQ_LLM_API_KEY", testAPIKey)
+
 	cfg := setting.NewCfg()
-	cfg.NLQEnabled = false
+	cfg.NLQEnabled = false // operator kill switch ON
 	cfg.NLQEndpoint = "https://example.invalid"
 
 	rr := routing.NewRouteRegister()
@@ -285,21 +355,36 @@ func TestProvideService_DualGate_FlagOnCfgOff_DoesNotRegister(t *testing.T) {
 	svc, err := ProvideService(
 		cfg,
 		rr,
-		&dsfakes.FakeDataSourceService{},
+		seedDataSources(),
 		actest.FakeAccessControl{ExpectedEvaluate: true},
 		features,
+		&pluginfakes.FakePluginClient{CallResourceHandlerFunc: failingCallResourceFunc},
+		nil,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, svc)
 
-	require.False(t, routeRegistered(rr, "POST", "/api/nlq/translate"),
-		"route MUST NOT be registered when cfg.NLQEnabled is false, even if the feature toggle is on")
+	// Route IS registered — the frontend can render its bar and
+	// will reach a structured 503 response, not a 404.
+	require.True(t, routeRegistered(rr, "POST", "/api/nlq/translate"),
+		"route MUST be registered when nlqEnabled feature toggle is on (regardless of cfg.NLQEnabled)")
+
+	// Translate short-circuits with ErrServiceDisabled. The schema
+	// fetch and the LLM call never run.
+	_, err = svc.Translate(context.Background(), TranslateRequest{
+		NaturalLanguage: "Show liveness",
+		DatasourceUID:   "prom-uid",
+		DatasourceType:  "prometheus",
+	}, testOrgID, nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrServiceDisabled,
+		"the returned error MUST be classifiable as ErrServiceDisabled via errors.Is when cfg.NLQEnabled is false")
 }
 
-// TestProvideService_DualGate_BothOn_Registers verifies that with
-// BOTH gates enabled the route is in fact registered. This is the
+// TestProvideService_BothOn_Registers verifies that with BOTH
+// gates enabled the route is in fact registered. This is the
 // positive control for the two previous negative tests.
-func TestProvideService_DualGate_BothOn_Registers(t *testing.T) {
+func TestProvideService_BothOn_Registers(t *testing.T) {
 	cfg := setting.NewCfg()
 	cfg.NLQEnabled = true
 	cfg.NLQEndpoint = "https://example.invalid"
@@ -313,12 +398,31 @@ func TestProvideService_DualGate_BothOn_Registers(t *testing.T) {
 		&dsfakes.FakeDataSourceService{},
 		actest.FakeAccessControl{ExpectedEvaluate: true},
 		features,
+		&pluginfakes.FakePluginClient{CallResourceHandlerFunc: failingCallResourceFunc},
+		nil,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, svc)
 
 	require.True(t, routeRegistered(rr, "POST", "/api/nlq/translate"),
 		"route MUST be registered when both cfg.NLQEnabled and the feature toggle are on")
+}
+
+// TestPostTranslate_ServiceDisabled_Returns503 exercises the
+// handler-level path for the feature-gate-harmonization fix. When
+// cfg.NLQEnabled is false, the handler MUST return HTTP 503 with
+// a structured JSON body — never a 404, even though the operator
+// has disabled the feature.
+func TestPostTranslate_ServiceDisabled_Returns503(t *testing.T) {
+	t.Setenv("GF_NLQ_LLM_API_KEY", testAPIKey)
+
+	svc := newTestService(t, "")
+	svc.cfg.NLQEnabled = false
+
+	rr := newReqRecorder(t, svc, `{"input":"test","datasourceUid":"prom-uid","datasourceType":"prometheus"}`)
+
+	require.Equal(t, http.StatusServiceUnavailable, rr.Code,
+		"handler MUST return 503 when [nlq] enabled=false (review feedback — feature gate harmonization)")
 }
 
 // TestTranslate_PrometheusSuccess validates AAP §0.6.4 row 1: the
@@ -365,7 +469,7 @@ func TestTranslate_PrometheusSuccess(t *testing.T) {
 		NaturalLanguage: "Graph total API request rate by endpoint over the last 24 hours",
 		DatasourceUID:   "prom-uid",
 		DatasourceType:  "prometheus",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.NoError(t, err, "Translate must succeed on a well-formed Prometheus request")
 	assert.Equal(t, "sum by (endpoint) (rate(http_requests_total[24h]))", resp.Query,
@@ -405,7 +509,7 @@ func TestTranslate_LokiSuccess(t *testing.T) {
 		NaturalLanguage: "Show me failed login attempts in the last hour grouped by IP",
 		DatasourceUID:   "loki-uid",
 		DatasourceType:  "loki",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.NoError(t, err, "Translate must succeed on a well-formed Loki request")
 	assert.Contains(t, resp.Query, "failed login",
@@ -433,7 +537,7 @@ func TestTranslate_UnsupportedDatasource(t *testing.T) {
 		NaturalLanguage: "Show me failed logins",
 		DatasourceUID:   "mysql-uid",
 		DatasourceType:  "mysql",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.Error(t, err, "Translate must return an error for an unsupported datasource type")
 	assert.ErrorIs(t, err, ErrUnsupportedDatasource,
@@ -459,7 +563,7 @@ func TestTranslate_MissingAPIKey(t *testing.T) {
 		NaturalLanguage: "test query",
 		DatasourceUID:   "prom-uid",
 		DatasourceType:  "prometheus",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.Error(t, err, "Translate must return an error when GF_NLQ_LLM_API_KEY is unset")
 	assert.ErrorIs(t, err, ErrMissingAPIKey,
@@ -501,7 +605,7 @@ func TestTranslate_LiveSchemaFetchFailure_ContinuesWithWarning(t *testing.T) {
 		NaturalLanguage: "Show up metric",
 		DatasourceUID:   "prom-uid",
 		DatasourceType:  "prometheus",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.NoError(t, err,
 		"Translate MUST NOT fail when LIVE schema fetch fails — AAP §0.6.4 row 8 requires graceful degradation")
@@ -538,7 +642,7 @@ func TestTranslate_DatasourceNotFound_HardFailure(t *testing.T) {
 		NaturalLanguage: "valid input",
 		DatasourceUID:   "unknown-uid",
 		DatasourceType:  "prometheus",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.Error(t, err, "Translate MUST return an error when the datasource UID does not resolve")
 	assert.ErrorIs(t, err, ErrInvalidDatasource,
@@ -571,7 +675,7 @@ func TestTranslate_TypeMismatch_HardFailure(t *testing.T) {
 		NaturalLanguage: "valid input",
 		DatasourceUID:   "mysql-uid",
 		DatasourceType:  "prometheus",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.Error(t, err, "Translate MUST return an error on UID/type mismatch")
 	assert.ErrorIs(t, err, ErrInvalidDatasource,
@@ -609,7 +713,7 @@ func TestTranslate_EmptyDatasourceUID_HardFailure(t *testing.T) {
 				NaturalLanguage: "valid input",
 				DatasourceUID:   tc.uid,
 				DatasourceType:  "prometheus",
-			}, testOrgID)
+			}, testOrgID, nil)
 
 			require.Error(t, err, "Translate MUST reject empty/whitespace DatasourceUID")
 			assert.ErrorIs(t, err, ErrInvalidDatasource,
@@ -637,7 +741,7 @@ func TestTranslate_LLMReturnsError_ReturnsErrLLMUnavailable(t *testing.T) {
 		NaturalLanguage: "test query",
 		DatasourceUID:   "prom-uid",
 		DatasourceType:  "prometheus",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.Error(t, err, "Translate must return an error when the LLM returns a non-2xx status")
 	assert.ErrorIs(t, err, ErrLLMUnavailable,
@@ -668,7 +772,7 @@ func TestTranslate_InvalidQuerySyntax_PromQL(t *testing.T) {
 		NaturalLanguage: "broken query test",
 		DatasourceUID:   "prom-uid",
 		DatasourceType:  "prometheus",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.Error(t, err, "Translate MUST reject a syntactically invalid PromQL query")
 	assert.ErrorIs(t, err, ErrInvalidQuerySyntax,
@@ -696,7 +800,7 @@ func TestTranslate_InvalidQuerySyntax_LogQL(t *testing.T) {
 		NaturalLanguage: "broken loki query",
 		DatasourceUID:   "loki-uid",
 		DatasourceType:  "loki",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.Error(t, err, "Translate MUST reject a syntactically invalid LogQL query")
 	assert.ErrorIs(t, err, ErrInvalidQuerySyntax,
@@ -805,7 +909,7 @@ func TestTranslate_APIKeyNotLeaked(t *testing.T) {
 		NaturalLanguage: "test query",
 		DatasourceUID:   "prom-uid",
 		DatasourceType:  "prometheus",
-	}, testOrgID)
+	}, testOrgID, nil)
 	require.Error(t, err, "the test precondition requires the LLM call to fail")
 
 	// Invariant 1: error message MUST NOT contain the key.
@@ -851,7 +955,7 @@ func TestTranslate_EmptyInput(t *testing.T) {
 		NaturalLanguage: "",
 		DatasourceUID:   "prom-uid",
 		DatasourceType:  "prometheus",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.Error(t, err, "Translate must return an error when NaturalLanguage is empty")
 	assert.ErrorIs(t, err, ErrEmptyInput,
@@ -881,7 +985,7 @@ func TestTranslate_AcceptsMimirAsPrometheusCompatible(t *testing.T) {
 		NaturalLanguage: "Show liveness",
 		DatasourceUID:   "mimir-uid",
 		DatasourceType:  "mimir",
-	}, testOrgID)
+	}, testOrgID, nil)
 
 	require.NoError(t, err, "Translate must accept 'mimir' as a Prometheus-compatible datasource type")
 	assert.Equal(t, "promql", resp.Language,

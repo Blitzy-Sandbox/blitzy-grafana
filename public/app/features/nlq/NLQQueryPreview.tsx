@@ -158,6 +158,27 @@ export function NLQQueryPreview({
     [theme]
   );
 
+  // NLQ feature CRITICAL review fix (NLQQueryPreview.tsx L188 — design
+  // token compliance): resolve the editor height through the active
+  // GrafanaTheme2 spacing scale rather than hardcoding a pixel literal.
+  //
+  // Grafana's default theme spacing base is 8px, so `theme.spacing(15)`
+  // resolves to "120px" — visually identical to the previous hardcoded
+  // value while ensuring the preview height tracks the design system if
+  // the spacing scale ever changes. `parseCssLengthToPx` strips the
+  // unit because Grafana's `CodeEditor.height` prop accepts only a
+  // numeric pixel count (verified in
+  // packages/grafana-ui/src/components/Monaco/types.ts).
+  //
+  // The `useMemo` keeps the numeric height stable across re-renders
+  // (matching the `monacoOptions` memoization rationale above) so the
+  // editor does not see height-prop identity churn that could trigger
+  // unnecessary internal reflow.
+  const editorHeightPx = useMemo(
+    () => parseCssLengthToPx(theme.spacing(15), 120),
+    [theme]
+  );
+
   // Pre-compute the editor's accessible label so the string flows through the
   // i18n pipeline (Crowdin) exactly once per render, and so the value is
   // stable across re-renders for the same locale.
@@ -185,7 +206,10 @@ export function NLQQueryPreview({
           <CodeEditor
             value={translatedQuery}
             language={language}
-            height={120}
+            // NLQ feature CRITICAL review fix: height is derived from
+            // the design-system spacing scale (see the editorHeightPx
+            // useMemo above) — no hardcoded pixel literal remains.
+            height={editorHeightPx}
             showMiniMap={false}
             showLineNumbers={true}
             // Both onBlur AND onSave wire to the same onChange callback so

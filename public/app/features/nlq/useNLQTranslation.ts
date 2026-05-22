@@ -35,12 +35,25 @@
 //     (see backend service docs for the exact mechanism). The no-log
 //     constraint is enforced here to prevent accidental telemetry of
 //     user-typed natural-language content.
+//   - Emits TWO post-outcome telemetry events via `reportInteraction` from
+//     `@grafana/runtime`, per AAP §0.6.3.2:
+//       - `grafana_nlq_translate_succeeded` fired exactly once when the
+//         backend HTTP call resolves successfully. Payload carries only
+//         non-sensitive metadata: `dsType`, `queryLength` (count, not
+//         contents), and `hadWarnings` (boolean).
+//       - `grafana_nlq_translate_failed` fired exactly once when the
+//         backend HTTP call rejects. Payload carries only `dsType` and a
+//         coarse `errorKind` classifier — NEVER the underlying error
+//         message, the user's input, or any LLM-generated content.
+//     This implements the no-leak-in-telemetry discipline applied to user
+//     content (mirrors the API key handling on the backend per AAP §0.8.5).
 //   - Single-turn only: each call to `translate()` is independent; the hook
 //     does NOT maintain conversation history (AAP §0.7.2.3).
 
 import { useCallback, useState } from 'react';
 
 import type { DataSourceInstanceSettings } from '@grafana/data';
+import { isFetchError, reportInteraction } from '@grafana/runtime';
 
 import { postTranslate } from './nlqApi';
 
@@ -355,7 +368,8 @@ export function useNLQTranslation(dsSettings: DataSourceInstanceSettings): UseNL
         // `query` as a required string, but a misbehaving server could send
         // `null`/`undefined`. Coercing to an empty string keeps the consuming
         // CodeEditor stable.
-        setTranslatedQuery(response.query ?? '');
+        const safeQuery = response.query ?? '';
+        setTranslatedQuery(safeQuery);
 
         // Defensive narrowing: although the `TranslateResponse` type declares
         // `language: 'promql' | 'logql'`, a misbehaving server could return an
@@ -371,7 +385,35 @@ export function useNLQTranslation(dsSettings: DataSourceInstanceSettings): UseNL
         // `explanation` and `warnings` are optional (`,omitempty` on the Go
         // side); coalesce missing values to safe empty defaults.
         setExplanation(response.explanation ?? '');
-        setWarnings(response.warnings ?? []);
+        const safeWarnings = response.warnings ?? [];
+        setWarnings(safeWarnings);
+
+        // NLQ feature MAJOR review fix (review feedback — observability):
+        // Emit the `grafana_nlq_translate_succeeded` interaction event
+        // mandated by AAP §0.6.3.2. The payload carries ONLY
+        // non-sensitive metadata that supports SLO/funnel analytics:
+        //   - `dsType` (the datasource plugin id, e.g. "prometheus") so
+        //     analytics can segment by backend.
+        //   - `queryLength` (a count, not the query itself) so analytics
+        //     can measure result-shape distributions without ever
+        //     transmitting the generated PromQL/LogQL — which can carry
+        //     operator metric names that are confidential in some
+        //     deployments.
+        //   - `hadWarnings` (a boolean) so analytics can correlate the
+        //     SOFT-failure schema-fetch path with downstream user
+        //     behavior.
+        // SECURITY (AAP §0.8.5 and the no-secret-in-telemetry discipline
+        // applied to user content as well): the raw natural-language
+        // input, the generated query string, the LLM explanation, and
+        // the warning messages are ALL deliberately excluded from the
+        // event payload. Centralizing this discipline in the hook
+        // (rather than at every call site in the component) guarantees
+        // the no-leak invariant across future call-site additions.
+        reportInteraction('grafana_nlq_translate_succeeded', {
+          dsType: dsSettings.type,
+          queryLength: safeQuery.length,
+          hadWarnings: safeWarnings.length > 0,
+        });
       } catch (err) {
         // Wrap non-Error throws so consumers can rely on `.message`.
         // The wrapping covers the three realistic shapes of a thrown value:
@@ -403,6 +445,52 @@ export function useNLQTranslation(dsSettings: DataSourceInstanceSettings): UseNL
         setLanguage('');
         setExplanation('');
         setWarnings([]);
+
+        // NLQ feature MAJOR review fix (review feedback — observability):
+        // Emit the `grafana_nlq_translate_failed` interaction event
+        // mandated by AAP §0.6.3.2. The payload carries ONLY
+        // non-sensitive metadata so analytics can monitor failure rates
+        // and break them down by backend without ever capturing user
+        // input or upstream error details:
+        //   - `dsType` for backend-level segmentation.
+        //   - `errorKind` — a coarse-grained classifier derived from
+        //     `(typeof err)` and the `Error` shape. We intentionally
+        //     avoid `err.message` (which may be the unlocalized backend
+        //     text, a fetch error URL, or an empty string) so the
+        //     analytics event never carries operator detail or
+        //     localized user-facing text.
+        // SECURITY (AAP §0.8.5): the raw error message and the user's
+        // input are deliberately excluded from the event payload to
+        // mirror the no-secret-in-telemetry discipline applied
+        // throughout the NLQ feature.
+        //
+        // The classifier order matters:
+        //   1. `isFetchError(err)` is checked FIRST because backendSrv
+        //      throws a plain object shaped as `FetchError` (interface,
+        //      not class) on non-2xx HTTP responses. A FetchError object
+        //      is NOT an `Error` instance, so without this branch the
+        //      most common failure path (LLM backend returning 4xx/5xx
+        //      surfaced as a FetchError) would be labelled 'unknown' —
+        //      defeating the analytics value of the event.
+        //   2. `err instanceof Error` for legitimate Error subclasses
+        //      thrown by application code (e.g. our defensive Error
+        //      wrapping in `nlqApi.ts`).
+        //   3. `typeof err === 'string'` for the rare bare-string throw.
+        //   4. Anything else falls through to 'unknown'.
+        let errorKind: 'fetch' | 'error' | 'string' | 'unknown';
+        if (isFetchError(err)) {
+          errorKind = 'fetch';
+        } else if (err instanceof Error) {
+          errorKind = 'error';
+        } else if (typeof err === 'string') {
+          errorKind = 'string';
+        } else {
+          errorKind = 'unknown';
+        }
+        reportInteraction('grafana_nlq_translate_failed', {
+          dsType: dsSettings.type,
+          errorKind,
+        });
       } finally {
         setIsLoading(false);
       }

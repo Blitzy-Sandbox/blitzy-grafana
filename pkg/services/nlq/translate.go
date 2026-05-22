@@ -67,6 +67,7 @@ import (
 	logqlsyntax "github.com/grafana/loki/v3/pkg/logql/syntax"
 
 	"github.com/grafana/grafana/pkg/api/response"
+	"github.com/grafana/grafana/pkg/apimachinery/identity"
 	ac "github.com/grafana/grafana/pkg/services/accesscontrol"
 	contextmodel "github.com/grafana/grafana/pkg/services/contexthandler/model"
 	"github.com/grafana/grafana/pkg/services/datasources"
@@ -230,7 +231,15 @@ func (s *Service) PostTranslate(c *contextmodel.ReqContext) response.Response {
 		return s.errorResponse(err)
 	}
 
-	resp, err := s.Translate(c.Req.Context(), req, orgID)
+	// NLQ feature MAJOR fix (review feedback — CallResource
+	// integration): forward c.SignedInUser to Translate so the
+	// downstream schema-fetch path can attach the caller's user
+	// identity to the plugin context envelope. This is how every
+	// other datasource-resource path in Grafana propagates caller
+	// identity into the plugin runtime (see pkg/expr/ml.go and
+	// pkg/registry/apis/datasource/querier.go for the established
+	// pattern).
+	resp, err := s.Translate(c.Req.Context(), req, orgID, c.SignedInUser)
 	if err != nil {
 		return s.errorResponse(err)
 	}
@@ -333,6 +342,15 @@ func (s *Service) errorResponse(err error) response.Response {
 		// client (the wrapped detail, if present, would have been
 		// logged by authorizeDatasourceQuery already).
 		return response.Error(http.StatusForbidden, "not authorized to query this datasource", nil)
+	case errors.Is(err, ErrServiceDisabled):
+		// NLQ feature MAJOR fix (review feedback — feature gate
+		// harmonization): operator has disabled the feature via
+		// [nlq] enabled=false. We return 503 Service Unavailable
+		// so the frontend Alert can render a clear localized
+		// message. The route is still mounted (gated only on the
+		// feature toggle) so the response is structured and
+		// recognizable — never a 404.
+		return response.Error(http.StatusServiceUnavailable, "NLQ translation is disabled by the operator", err)
 	case errors.Is(err, ErrMissingAPIKey):
 		// 500 (not 401/403) because this is an operator
 		// misconfiguration, not a caller problem. The caller
@@ -409,6 +427,13 @@ func (s *Service) errorResponse(err error) response.Response {
 // caller (PostTranslate) from c.GetOrgID(). It is forwarded to
 // fetchSchemaContext for the multi-tenant datasource lookup.
 //
+// user is the authenticated caller's identity envelope. It is
+// forwarded into fetchSchemaContext so plugin-context construction
+// can embed the caller's user identity in the CallResource request
+// (matching how every other datasource resource call attaches user
+// identity). Tests may pass nil for non-RBAC-sensitive paths; the
+// schema-fetch code-path treats nil as "anonymous service caller".
+//
 // Context propagation: ctx is propagated into fetchSchemaContext
 // (so a downstream cancellation aborts the datasource lookup) and
 // into callLLM (so a downstream cancellation aborts the LLM HTTP
@@ -417,7 +442,20 @@ func (s *Service) errorResponse(err error) response.Response {
 // Error semantics: returns ONLY the typed sentinels declared in
 // models.go (potentially wrapped with %w to add context). Callers
 // MUST use errors.Is for classification.
-func (s *Service) Translate(ctx context.Context, req TranslateRequest, orgID int64) (TranslateResponse, error) {
+func (s *Service) Translate(ctx context.Context, req TranslateRequest, orgID int64, user identity.Requester) (TranslateResponse, error) {
+	// NLQ feature MAJOR fix (review feedback — feature gate
+	// harmonization): if the operator has disabled the feature via
+	// [nlq] enabled=false, short-circuit BEFORE any input
+	// validation, schema fetch, or LLM call. The route is mounted
+	// whenever the feature toggle is on, but this gate gives the
+	// operator a runtime kill switch — useful when the LLM endpoint
+	// must be taken down for maintenance without disabling the
+	// frontend feature flag (which would require redeploying the
+	// bootdata).
+	if s.cfg == nil || !s.cfg.NLQEnabled {
+		return TranslateResponse{}, ErrServiceDisabled
+	}
+
 	// 1. Validate input.
 	naturalLanguage := strings.TrimSpace(req.NaturalLanguage)
 	if naturalLanguage == "" {
@@ -455,12 +493,12 @@ func (s *Service) Translate(ctx context.Context, req TranslateRequest, orgID int
 	//     in ErrInvalidDatasource and short-circuit the entire
 	//     translation with a 400 response. No LLM call is made.
 	//   - SOFT: any other error (e.g. the live /api/v1/labels
-	//     metadata fetch hit a 5xx). These come back wrapped in
-	//     a generic transport error and are downgraded to a
-	//     Warnings entry. The translation proceeds with the base
-	//     hints.
+	//     metadata fetch via CallResource failed). These come back
+	//     wrapped in a generic transport error and are downgraded
+	//     to a Warnings entry. The translation proceeds with the
+	//     base hints.
 	var warnings []string
-	schemaCtx, schemaErr := s.fetchSchemaContext(ctx, req, orgID)
+	schemaCtx, schemaErr := s.fetchSchemaContext(ctx, req, orgID, user)
 	if schemaErr != nil {
 		if errors.Is(schemaErr, ErrInvalidDatasource) {
 			// HARD fail: the datasource UID is not consistent with
@@ -666,7 +704,25 @@ func (s *Service) callLLM(ctx context.Context, systemPrompt, userPrompt string) 
 	// the context for cancellation propagation.
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.NLQEndpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("%w: build request: %v", ErrLLMUnavailable, err)
+		// SECURITY (AAP §0.8.5 — MINOR review finding):
+		// http.NewRequestWithContext wraps URL parse errors in
+		// *url.Error which embeds the full request URL — including
+		// any path, query string, or (in pathological
+		// misconfigurations) userinfo from the configured endpoint.
+		// Route the underlying error through sanitizeTransportError
+		// to strip the URL surface before composing the wrapped
+		// message, matching the treatment used downstream in
+		// httpClient.Do failures. The configured endpoint must
+		// never leak through an error envelope; only the host
+		// (via safeHost in the structured log fields below) is
+		// safe to surface.
+		sanitized := sanitizeTransportError(err)
+		s.log.Error("NLQ feature: LLM request construction failed",
+			"host", safeHost(s.cfg.NLQEndpoint),
+			"model", s.cfg.NLQModel,
+			"error", sanitized,
+		)
+		return nil, fmt.Errorf("%w: build request: %s", ErrLLMUnavailable, sanitized)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")

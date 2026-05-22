@@ -26,6 +26,11 @@ import { getDefaults } from 'app/features/expressions/utils/expressionTypes';
 import { InspectTab } from 'app/features/inspector/types';
 // NLQ feature: import the natural language query bar (gated by config.featureToggles.nlqEnabled)
 import { NaturalLanguageQueryBar } from 'app/features/nlq';
+// NLQ feature: reuse the existing visualization-suggestion utility for "Add as Panel"
+// flow per AAP §0.1.1 / §0.6.4 criterion #4. This is the same utility consumed by
+// `VisualizationSuggestions.tsx`; importing it here keeps the suggestion logic
+// centralized and avoids any new dependency.
+import { getAllSuggestions } from 'app/features/panel/suggestions/getAllSuggestions';
 import { GroupActionComponents } from 'app/features/query/components/QueryActionComponent';
 import { QueryEditorRows } from 'app/features/query/components/QueryEditorRows';
 import { QueryGroupTopSection } from 'app/features/query/components/QueryGroup';
@@ -364,6 +369,83 @@ export function PanelDataQueriesTabRendered({ model }: SceneComponentProps<Panel
     [model]
   );
 
+  // NLQ feature (Checkpoint 4 fix — C4): Run callback for the NLQ bar.
+  //
+  // Appends the (possibly user-edited) NLQ-generated query string to the
+  // panel's existing query list and triggers a query-runner run. The query
+  // is shaped as `{ expr }` because all NLQ-supported datasource backends
+  // (Prometheus, Mimir, Loki) carry the query text in an `expr` field on
+  // their respective `DataQuery` subtypes. The local type
+  // `Partial<DataQuery> & { expr: string }` describes the shape precisely
+  // (`Partial<DataQuery>` because `addQuery()` fills in `refId`/`hide`/
+  // `datasource`; `& { expr: string }` because `expr` is the canonical
+  // query string field on Prom/Loki). Extra fields beyond the base
+  // interface flow through `addQuery()` via object spread (see
+  // `public/app/core/utils/query.ts`). Using an intersection type here —
+  // rather than an `as` assertion — keeps us within the project lint
+  // policy (`@typescript-eslint/consistent-type-assertions`).
+  //
+  // `_language` is accepted on the callback signature for symmetry with
+  // `onAddPanel` and so the analytics event in the bar can include the
+  // language; it is not consumed here because the datasource ref on the
+  // generated query carries the correct backend type.
+  const handleNLQRun = useCallback(
+    (query: string, _language: 'promql' | 'logql') => {
+      const newQuery: Partial<DataQuery> & { expr: string } = { expr: query };
+      model.onAddQuery(newQuery);
+      model.onRunQueries();
+    },
+    [model]
+  );
+
+  // NLQ feature (Checkpoint 4 fix — C4 + M3): Add-as-Panel callback for the NLQ bar.
+  //
+  // Implements AAP §0.6.4 criterion #4 by:
+  //   1. Appending the NLQ-generated query to the panel's query list
+  //      (delegates to the existing `onAddQuery` flow — no schema mutation,
+  //      no new APIs).
+  //   2. Triggering a query-runner run so the data backing the new query
+  //      is fetched.
+  //   3. Calling the existing `getAllSuggestions(data)` utility (per
+  //      AAP §0.1.1 and §0.6.4 criterion #4) to derive a recommended
+  //      visualization plugin id from the data summary that is currently
+  //      backing the panel. The user can always change the visualization
+  //      afterward through the standard Options pane.
+  //   4. Applying the top suggestion via `VizPanel.changePluginType()` —
+  //      the same scene API used by `PanelOptionsPane.tsx` when the user
+  //      changes the visualization manually, so there is no new code path.
+  //
+  // The suggestion step is wrapped in try/catch so a failure to load
+  // suggestion plugins is non-fatal: the query is still added, and the
+  // existing panel visualization is preserved. The warning is logged to
+  // the console only (no leak of the LLM-generated query text).
+  //
+  // `data` is included in the dependency list so the callback always
+  // reads from the latest panel data when suggesting a visualization.
+  const handleNLQAddPanel = useCallback(
+    async (query: string, _language: 'promql' | 'logql') => {
+      const newQuery: Partial<DataQuery> & { expr: string } = { expr: query };
+      model.onAddQuery(newQuery);
+      model.onRunQueries();
+
+      try {
+        const result = await getAllSuggestions(data);
+        const topSuggestion = result?.suggestions?.[0];
+        if (topSuggestion?.pluginId) {
+          const panel = model.state.panelRef.resolve();
+          panel.changePluginType(topSuggestion.pluginId);
+        }
+      } catch (err) {
+        // Non-fatal: the query was successfully added; only the
+        // visualization recommendation step failed. Do NOT log `query` or
+        // any user-supplied content per AAP §0.8.5 (no secret leakage in
+        // logs); the bare error is sufficient for triage.
+        console.warn('NLQ: failed to resolve visualization suggestion', err);
+      }
+    },
+    [model, data]
+  );
+
   if (!datasource || !dsSettings || !data) {
     return null;
   }
@@ -397,9 +479,18 @@ export function PanelDataQueriesTabRendered({ model }: SceneComponentProps<Panel
 
   return (
     <div data-testid={selectors.components.QueryTab.content}>
-      {/* NLQ feature: conditional render of the natural language query bar, gated by feature toggle */}
+      {/* NLQ feature: conditional render of the natural language query bar, gated by feature toggle.
+          Both `onRun` and `onAddPanel` are REQUIRED props on `NaturalLanguageQueryBar` (per
+          Checkpoint 4 review fix C3); they delegate to the existing `model.onAddQuery` +
+          `model.onRunQueries` flow and to `getAllSuggestions()` for the visualization
+          recommendation (per AAP §0.6.4 criteria #3 and #4). */}
       {config.featureToggles.nlqEnabled && dsSettings && (
-        <NaturalLanguageQueryBar dsSettings={dsSettings} panelRef={model.state.panelRef} />
+        <NaturalLanguageQueryBar
+          dsSettings={dsSettings}
+          panelRef={model.state.panelRef}
+          onRun={handleNLQRun}
+          onAddPanel={handleNLQAddPanel}
+        />
       )}
       <QueryGroupTopSection
         data={data}

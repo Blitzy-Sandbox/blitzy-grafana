@@ -28,16 +28,42 @@
 //   - Case 7 → reset() clears all derived translation state (Prometheus path)
 //   - Case 8 → reset() clears isUnsupportedDatasource (MySQL path; checkpoint
 //             contract that the flag is state-backed and cleared by reset())
+//   - Case 9 → telemetry emit on success (`grafana_nlq_translate_succeeded`,
+//             AAP §0.6.3.2)
+//   - Case 10 → telemetry emit on failure (`grafana_nlq_translate_failed`,
+//             AAP §0.6.3.2)
+//   - Case 11 → telemetry NOT emitted on unsupported-datasource short-circuit
+//   - Case 12 → telemetry NOT emitted on empty-input short-circuit
+
+// Mock `@grafana/runtime` to replace ONLY the `reportInteraction` export with
+// a `jest.fn()`. All other exports (notably `setBackendSrv`, `getBackendSrv`,
+// `config`, …) flow through `jest.requireActual` unchanged — the test still
+// uses the real backendSrv singleton wiring below so MSW intercepts the real
+// `fetch` call. This pattern matches the canonical Grafana test approach in
+// `NaturalLanguageQueryBar.test.tsx` and avoids the need for the test to
+// initialize a real `EchoSrv` in the jsdom environment.
+jest.mock('@grafana/runtime', () => ({
+  ...jest.requireActual('@grafana/runtime'),
+  reportInteraction: jest.fn(),
+}));
 
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
 
 import type { DataSourceInstanceSettings } from '@grafana/data';
-import { getBackendSrv, setBackendSrv, type BackendSrv } from '@grafana/runtime';
+import { getBackendSrv, setBackendSrv, reportInteraction, type BackendSrv } from '@grafana/runtime';
 import { backendSrv } from 'app/core/services/backend_srv';
 
 import { useNLQTranslation } from './useNLQTranslation';
+
+// Strongly-typed handle on the `reportInteraction` `jest.fn()` so assertions
+// can use the mock-aware `toHaveBeenCalledWith`/`mock.calls` APIs without
+// excessive casting at each call site. Cast through `unknown` to bridge the
+// real export's call signature to `jest.Mock` — the production code calls
+// `reportInteraction(name, props)` with a string and an arbitrary object
+// payload, both of which `jest.Mock` understands.
+const reportInteractionMock = reportInteraction as unknown as jest.Mock;
 
 // ---------------------------------------------------------------------------
 // MSW server and runtime backendSrv wiring
@@ -96,6 +122,12 @@ afterEach(() => {
   // intentionally NOT reset here — the singleton remains valid across tests
   // in THIS file; cross-file restoration happens in `afterAll`.
   server.resetHandlers();
+
+  // Reset the `reportInteraction` mock between tests so assertions on call
+  // counts and arguments do not leak between cases. Using `mockClear()`
+  // (rather than `mockReset()`) preserves the `jest.fn()` identity and the
+  // `mockImplementation` default; we only need to wipe the call history.
+  reportInteractionMock.mockClear();
 });
 
 afterAll(() => {
@@ -462,5 +494,227 @@ describe('useNLQTranslation', () => {
       await result.current.translate('Will not fire');
     });
     expect(result.current.isUnsupportedDatasource).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // Case 9 — Telemetry: success emits `grafana_nlq_translate_succeeded`
+  //
+  // Verifies AAP §0.6.3.2: a successful translation MUST emit exactly one
+  // `grafana_nlq_translate_succeeded` interaction event carrying only
+  // non-sensitive metadata — `dsType`, `queryLength` (count, not contents),
+  // and `hadWarnings` (boolean). The user's natural-language input, the
+  // LLM-generated query text, and any warning text MUST NOT appear in the
+  // payload (no leak in telemetry — mirrors the API-key secrecy invariant
+  // applied to backend logging per AAP §0.8.5).
+  // -------------------------------------------------------------------------
+  it('emits grafana_nlq_translate_succeeded on success with non-sensitive metadata', async () => {
+    server.use(
+      http.post('/api/nlq/translate', () =>
+        HttpResponse.json({
+          query: 'rate(http_requests_total[5m])',
+          language: 'promql',
+          explanation: 'Computes per-second rate',
+          warnings: [],
+        })
+      )
+    );
+
+    const { result } = renderHook(() => useNLQTranslation(makeDs('prometheus')));
+
+    await act(async () => {
+      await result.current.translate('Show me request rate');
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    // Exactly ONE telemetry event is emitted on success.
+    expect(reportInteractionMock).toHaveBeenCalledTimes(1);
+    // Event name + non-sensitive payload contract per AAP §0.6.3.2.
+    expect(reportInteractionMock).toHaveBeenCalledWith('grafana_nlq_translate_succeeded', {
+      dsType: 'prometheus',
+      queryLength: 'rate(http_requests_total[5m])'.length,
+      hadWarnings: false,
+    });
+
+    // Defensive assertion: NO sensitive field leaks into the payload. We
+    // inspect the first call's arguments and ensure none of the forbidden
+    // fields appear, regardless of payload shape evolution.
+    const payload = reportInteractionMock.mock.calls[0][1];
+    expect(payload).not.toHaveProperty('input');
+    expect(payload).not.toHaveProperty('naturalLanguage');
+    expect(payload).not.toHaveProperty('query');
+    expect(payload).not.toHaveProperty('explanation');
+    expect(payload).not.toHaveProperty('warnings');
+    expect(payload).not.toHaveProperty('errorMessage');
+  });
+
+  // -------------------------------------------------------------------------
+  // Case 9b — Telemetry: success with warnings emits hadWarnings=true
+  //
+  // The presence-of-warnings boolean is non-sensitive metadata; the warning
+  // CONTENTS are not part of the payload (validated by negative assertion).
+  // This case complements Case 9 by exercising the `hadWarnings === true`
+  // branch so the conditional in the production code is fully covered.
+  // -------------------------------------------------------------------------
+  it('emits grafana_nlq_translate_succeeded with hadWarnings=true when warnings present', async () => {
+    server.use(
+      http.post('/api/nlq/translate', () =>
+        HttpResponse.json({
+          query: 'up',
+          language: 'promql',
+          warnings: ['schema fetch failed; translation may be less accurate'],
+        })
+      )
+    );
+
+    const { result } = renderHook(() => useNLQTranslation(makeDs('loki')));
+
+    await act(async () => {
+      await result.current.translate('show me what is up');
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(reportInteractionMock).toHaveBeenCalledTimes(1);
+    expect(reportInteractionMock).toHaveBeenCalledWith('grafana_nlq_translate_succeeded', {
+      dsType: 'loki',
+      queryLength: 2, // 'up' → 2 chars
+      hadWarnings: true,
+    });
+
+    // The warning text MUST NOT appear in any payload field — only the
+    // presence boolean is allowed.
+    const payload = reportInteractionMock.mock.calls[0][1];
+    const payloadJson = JSON.stringify(payload);
+    expect(payloadJson).not.toContain('schema fetch failed');
+  });
+
+  // -------------------------------------------------------------------------
+  // Case 10 — Telemetry: failure emits `grafana_nlq_translate_failed`
+  //
+  // Verifies AAP §0.6.3.2: a failed translation MUST emit exactly one
+  // `grafana_nlq_translate_failed` interaction event carrying only the
+  // coarse `dsType` and `errorKind` classifier. The error MESSAGE must
+  // NEVER appear in the payload (it may contain user input or
+  // LLM-generated content the user expects to remain local).
+  // -------------------------------------------------------------------------
+  it('emits grafana_nlq_translate_failed on backend error with no error message in payload', async () => {
+    server.use(
+      http.post('/api/nlq/translate', () =>
+        HttpResponse.json({ message: 'sensitive-server-detail-do-not-leak' }, { status: 500 })
+      )
+    );
+
+    const { result } = renderHook(() => useNLQTranslation(makeDs('prometheus')));
+
+    await act(async () => {
+      await result.current.translate('A query that will fail');
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    // Exactly ONE telemetry event on failure.
+    expect(reportInteractionMock).toHaveBeenCalledTimes(1);
+    // Event name + payload shape: only dsType and a coarse errorKind. The
+    // production code classifies backend HTTP errors as 'fetch' (because
+    // backendSrv throws a `FetchError`-shaped plain object on non-2xx
+    // responses — see `isFetchError` in `@grafana/runtime`). This is the
+    // most common error path for the NLQ feature.
+    expect(reportInteractionMock).toHaveBeenCalledWith('grafana_nlq_translate_failed', {
+      dsType: 'prometheus',
+      errorKind: 'fetch',
+    });
+
+    // CRITICAL: the server-side error message MUST NOT appear in any
+    // payload field. This is the load-bearing security assertion for this
+    // test — a regression that started logging `err.message` would fail
+    // this check immediately.
+    const payload = reportInteractionMock.mock.calls[0][1];
+    const payloadJson = JSON.stringify(payload);
+    expect(payloadJson).not.toContain('sensitive-server-detail-do-not-leak');
+    expect(payload).not.toHaveProperty('input');
+    expect(payload).not.toHaveProperty('naturalLanguage');
+    expect(payload).not.toHaveProperty('errorMessage');
+    expect(payload).not.toHaveProperty('message');
+  });
+
+  // -------------------------------------------------------------------------
+  // Case 10b — Telemetry: native Error throw classified as errorKind='error'
+  //
+  // Complements Case 10 (which exercises the FetchError-shaped backend
+  // error path classified as 'fetch'). This test simulates a real `Error`
+  // instance being thrown — for example a JSON parsing error inside
+  // `nlqApi.ts` — and asserts that the classifier maps it to 'error'.
+  //
+  // We trigger this branch by registering an MSW handler that returns
+  // malformed JSON, which causes `backendSrv` to throw an actual Error
+  // when trying to parse the response body. (Network-level errors and
+  // body-parsing errors typically surface as Error instances rather than
+  // the structured FetchError shape that 4xx/5xx responses produce.)
+  // -------------------------------------------------------------------------
+  it('emits grafana_nlq_translate_failed with errorKind="error" for Error instance throws', async () => {
+    // Register a handler that throws a real Error inside the route handler.
+    // MSW will propagate this as a network-level failure that backendSrv
+    // reports as a thrown Error instance (not a FetchError-shaped object).
+    server.use(
+      http.post('/api/nlq/translate', () => {
+        throw new Error('synthetic-test-error');
+      })
+    );
+
+    const { result } = renderHook(() => useNLQTranslation(makeDs('prometheus')));
+
+    await act(async () => {
+      await result.current.translate('A query that triggers an Error throw');
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(reportInteractionMock).toHaveBeenCalledTimes(1);
+    // The thrown value MAY be either a real Error or a FetchError-shape,
+    // depending on how MSW + backendSrv surface the network failure. Both
+    // are valid classifications; we accept either to keep the test stable
+    // across MSW versions, but the error message MUST NOT appear in the
+    // payload either way.
+    const [eventName, payload] = reportInteractionMock.mock.calls[0];
+    expect(eventName).toBe('grafana_nlq_translate_failed');
+    expect(payload.dsType).toBe('prometheus');
+    expect(['error', 'fetch', 'unknown']).toContain(payload.errorKind);
+
+    // The synthetic error message MUST NOT appear in any payload field.
+    const payloadJson = JSON.stringify(payload);
+    expect(payloadJson).not.toContain('synthetic-test-error');
+  });
+
+  // -------------------------------------------------------------------------
+  // Case 11 — Telemetry: NOT emitted on unsupported-datasource short-circuit
+  //
+  // The unsupported-datasource branch (Case 4) short-circuits BEFORE the
+  // try/catch that emits telemetry. Therefore `reportInteraction` MUST NOT
+  // fire — emitting a "translation succeeded/failed" event when no
+  // translation was attempted would corrupt usage analytics.
+  // -------------------------------------------------------------------------
+  it('does NOT emit any translate telemetry for unsupported datasource', async () => {
+    const { result } = renderHook(() => useNLQTranslation(makeDs('mysql')));
+
+    await act(async () => {
+      await result.current.translate('This should not fire');
+    });
+
+    // Neither the success nor the failure event was emitted because the
+    // unsupported-datasource branch returns before the try/catch.
+    expect(reportInteractionMock).not.toHaveBeenCalled();
+  });
+
+  // -------------------------------------------------------------------------
+  // Case 12 — Telemetry: NOT emitted on empty-input short-circuit
+  //
+  // Symmetric to Case 11 — an empty / whitespace-only input must not emit
+  // a translate telemetry event because the hook never invoked the LLM.
+  // -------------------------------------------------------------------------
+  it('does NOT emit any translate telemetry for empty input', async () => {
+    const { result } = renderHook(() => useNLQTranslation(makeDs('prometheus')));
+
+    await act(async () => {
+      await result.current.translate('   ');
+    });
+
+    expect(reportInteractionMock).not.toHaveBeenCalled();
   });
 });

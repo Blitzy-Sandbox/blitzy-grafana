@@ -41,6 +41,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -48,9 +49,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	pluginfakes "github.com/grafana/grafana/pkg/plugins/manager/pluginfakes"
 	"github.com/grafana/grafana/pkg/services/accesscontrol"
 	"github.com/grafana/grafana/pkg/services/accesscontrol/acimpl"
 	"github.com/grafana/grafana/pkg/services/datasources"
@@ -71,6 +74,35 @@ const nlqTestOrgID int64 = 1
 // file. Permissions are attached to this user via authedUserWithPermissions
 // (declared in common_test.go).
 const nlqTestUserID int64 = 1
+
+// nlqTestFailingCallResource is the default plugin-client behavior used
+// by the NLQ API integration tests: every CallResource invocation
+// returns a transport error so the live schema-metadata fetch issued by
+// pkg/services/nlq/schema_context.go SOFT-fails. That produces the
+// Warnings entry on the TranslateResponse body which these tests
+// assert against.
+//
+// Tests that need a different behavior (e.g., a 2xx response with
+// canned label data) construct their own pluginfakes.FakePluginClient
+// with a customised CallResourceHandlerFunc.
+var nlqTestFailingCallResource = backend.CallResourceHandlerFunc(func(_ context.Context, _ *backend.CallResourceRequest, _ backend.CallResourceResponseSender) error {
+	return errNLQTestFailingCallResource
+})
+
+// errNLQTestFailingCallResource is the sentinel error returned by
+// nlqTestFailingCallResource. Centralised so its message can be
+// audited in one place — the message MUST NEVER contain anything
+// that resembles an API key or response body so it never confuses
+// the no-leak assertions in TestNLQAPI_Translate_DoesNotEchoAPIKey.
+var errNLQTestFailingCallResource = errNLQTestSentinelError("synthetic plugin transport failure for NLQ API tests")
+
+// errNLQTestSentinelError is a typed string error used by the NLQ
+// API tests' plugin-client fake. Declared as its own type so future
+// type assertions or errors.As classification stay explicit.
+type errNLQTestSentinelError string
+
+// Error satisfies the error interface for errNLQTestSentinelError.
+func (e errNLQTestSentinelError) Error() string { return string(e) }
 
 // seedNLQDataSources returns a FakeDataSourceService pre-populated with
 // a Prometheus and a Loki datasource. The URLs point to a deliberately
@@ -122,8 +154,12 @@ func seedNLQDataSources() *fakeDatasources.FakeDataSourceService {
 //  2. The opt callback (this function's body) populates hs.Cfg,
 //     hs.Features, and hs.AccessControl with NLQ-aware values and invokes
 //     nlq.ProvideService(...). ProvideService's constructor body calls
-//     registerAPIEndpoints() because BOTH gates are on (cfg.NLQEnabled
-//     and featuremgmt.FlagNlqEnabled). This mounts POST /api/nlq/translate
+//     registerAPIEndpoints() because the nlqEnabled feature toggle is on
+//     (per the harmonized-gate contract introduced by the MAJOR review
+//     finding fix in pkg/services/nlq/service.go: route registration is
+//     keyed solely on the feature toggle; cfg.NLQEnabled becomes a
+//     runtime kill switch enforced inside the handler via
+//     ErrServiceDisabled -> HTTP 503). This mounts POST /api/nlq/translate
 //     onto hs.RouteRegister.
 //  3. After the opt callback returns, SetupAPITestServer calls
 //     hs.registerRoutes() to mount the legacy HTTPServer routes on the
@@ -143,7 +179,11 @@ func setupNLQTestServer(t *testing.T, llmURL string, dsService datasources.DataS
 	t.Helper()
 	return SetupAPITestServer(t, func(hs *HTTPServer) {
 		cfg := setting.NewCfg()
-		// NLQ feature: enable both gates so the route is registered.
+		// NLQ feature: enable both gates so the route is registered
+		// AND the handler does not short-circuit with ErrServiceDisabled.
+		// cfg.NLQEnabled is now an in-handler kill switch (see the
+		// harmonized-gate contract above); leaving it true means the
+		// happy-path tests reach the translation pipeline.
 		cfg.NLQEnabled = true
 		cfg.NLQProvider = "openai"
 		cfg.NLQEndpoint = llmURL
@@ -151,9 +191,10 @@ func setupNLQTestServer(t *testing.T, llmURL string, dsService datasources.DataS
 		hs.Cfg = cfg
 
 		// NLQ feature: enable the feature flag so ProvideService mounts
-		// the route. BOTH gates (cfg.NLQEnabled AND
-		// featuremgmt.FlagNlqEnabled) must be on per the dual-gate
-		// contract in pkg/services/nlq/service.go.
+		// the route. Under the harmonized-gate contract (MAJOR review
+		// finding fix), route registration is keyed solely on the
+		// feature toggle; the cfg.NLQEnabled gate is a runtime
+		// operator kill switch enforced inside the handler.
 		features := featuremgmt.WithFeatures(featuremgmt.FlagNlqEnabled)
 		hs.Features = features
 
@@ -166,12 +207,28 @@ func setupNLQTestServer(t *testing.T, llmURL string, dsService datasources.DataS
 			dsService = seedNLQDataSources()
 		}
 
+		// NLQ feature MAJOR fix (review feedback — CallResource
+		// integration): the NLQ service requires a plugins.Client and
+		// a *plugincontext.Provider for live schema metadata retrieval.
+		// In these API integration tests we want the live fetch to
+		// SOFT-fail (so the response body contains a Warnings entry
+		// without blocking the LLM call) — supplying a FakePluginClient
+		// whose CallResourceHandlerFunc returns an error, plus a nil
+		// pluginCtx, makes the plugin runtime defensive check inside
+		// schema_context.go return early with "plugin runtime not
+		// configured". That error is treated as a soft failure by the
+		// orchestrator, exactly matching the pre-fix behavior these
+		// tests were written against.
+		pluginClient := &pluginfakes.FakePluginClient{
+			CallResourceHandlerFunc: nlqTestFailingCallResource,
+		}
+
 		// NLQ feature: register the translation service. ProvideService's
-		// constructor calls registerAPIEndpoints() synchronously when both
-		// gates are enabled, mounting POST /api/nlq/translate on
+		// constructor calls registerAPIEndpoints() synchronously when the
+		// feature toggle is enabled, mounting POST /api/nlq/translate on
 		// hs.RouteRegister (which is the same RouteRegister webtest.NewServer
 		// hands to the running HTTP server).
-		_, err := nlq.ProvideService(cfg, hs.RouteRegister, dsService, hs.AccessControl, features)
+		_, err := nlq.ProvideService(cfg, hs.RouteRegister, dsService, hs.AccessControl, features, pluginClient, nil)
 		require.NoError(t, err, "nlq.ProvideService must succeed in the test harness")
 	})
 }

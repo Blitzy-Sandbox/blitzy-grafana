@@ -1,6 +1,6 @@
 // schema_context.go provides the datasource-metadata bridge between
 // the NLQ translation orchestrator (translate.go's Translate) and
-// Grafana's existing datasources.DataSourceService interface.
+// Grafana's existing datasources.DataSourceService + plugin runtime.
 //
 // The single exported behavior in this file is the unexported method
 // (*Service).fetchSchemaContext, which the orchestrator calls to enrich
@@ -23,37 +23,52 @@
 //     LLM work against an inconsistent datasource identity.
 //
 //  2. SOFT failures — any other error (live metadata fetch over
-//     HTTP failed for any reason — DNS, 5xx, timeout, malformed
-//     JSON, etc.).
+//     CallResource failed for any reason — DNS, plugin error, 5xx,
+//     malformed JSON, etc.).
 //     Translate downgrades these to a Warnings entry on the
 //     response and continues with the base hints. The translation
 //     still produces a usable result; the LLM simply lacks the
 //     full real-time label/metric vocabulary.
 //
 // SCOPE — LIVE METADATA FETCH (NLQ feature MAJOR review finding,
-// AAP §0.1.1 schema grounding requirement):
-// This file performs a best-effort live HTTP call against the
-// datasource backend to retrieve real label names (and Prometheus
-// metric names) using the same upstream API contracts that the
-// existing Prometheus and Loki backends already consume:
+// AAP §0.1.1 schema grounding + §0.4.3.6 integration requirements):
+// This file performs a best-effort live metadata fetch against the
+// datasource backend via the canonical Grafana CallResource RPC.
+// CallResource routes the call through the full plugin runtime
+// transport chain:
 //
-//   - Prometheus / Mimir: GET <ds.URL>/api/v1/labels and
-//     GET <ds.URL>/api/v1/label/__name__/values
-//   - Loki:               GET <ds.URL>/loki/api/v1/labels
+//   - secureSocksProxy egress
+//   - TLS configuration (CA bundle, client certs, skip verify)
+//   - HTTP client middleware (auth headers, OAuth identity
+//     forwarding, custom headers, basic-auth credentials —
+//     INCLUDING credentials stored in SecureJsonData)
+//   - the plugin's CallResource implementation
 //
-// The HTTP client used is the same httpClient already injected on
-// the Service (constructed in service.go with a 30s timeout). The
-// call propagates BasicAuth credentials from the datasource record
-// when ds.BasicAuth is true. SECURITY: ds.BasicAuthPassword is read
-// at call time and never logged or returned in error messages.
+// Endpoint mapping (matches the upstream contracts that the
+// Prometheus and Loki backends implement):
 //
-// This is intentionally lighter-weight than CallResource — it does
-// not invoke the plugin client layer (which would require a Wire
-// dependency expansion contrary to AAP §0.8.1's Minimal Change
-// Clause). The cost is that secureSocksProxy, TLS client-cert
-// auth, and other advanced datasource transport features are not
-// honored; deployments that rely on those will simply fall back to
-// the base hints via the SOFT failure path.
+//   - Prometheus / Mimir:
+//     Path "api/v1/labels"                        — label names
+//     Path "api/v1/label/__name__/values"         — metric names
+//     (see pkg/promlib/resource/resource.go for the canonical
+//     proxy registration of these paths.)
+//   - Loki:
+//     Path "loki/api/v1/labels"                   — log-stream
+//     label names
+//     (see pkg/tsdb/loki/api.go for the resource handler.)
+//
+// SECURITY (AAP §0.8.5):
+//   - The plugin context construction reads decrypted
+//     SecureJsonData via plugincontext.GetWithDataSource; the
+//     resulting backend.PluginContext is opaque to this file —
+//     no credential value is touched, read, logged, or returned.
+//   - The CallResource sender accumulates ONLY the response body
+//     up to schemaContextMaxBytes; status codes are inspected but
+//     not used to populate error messages.
+//   - The full request URL is not constructed in this file. The
+//     plugin runtime constructs it from ds.URL and the path
+//     suffix passed here; only the host (via safeHost on ds.URL)
+//     is logged in structured fields, never the full URL.
 
 package nlq
 
@@ -62,22 +77,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
+	"github.com/grafana/grafana-plugin-sdk-go/backend"
+
+	"github.com/grafana/grafana/pkg/apimachinery/identity"
 	"github.com/grafana/grafana/pkg/services/datasources"
 )
 
-// schemaFetchTimeoutNote captures the Service-level httpClient
-// timeout that bounds every live metadata HTTP call. Documented
-// here for traceability — the actual timeout is set in
-// service.go's ProvideService where the httpClient is constructed.
-
-// schemaContextMaxBytes caps the response body read for any live
-// metadata fetch. The Prometheus /api/v1/labels endpoint typically
-// returns a few KiB; this ceiling defends against a misbehaving
-// upstream returning an unbounded body.
+// schemaContextMaxBytes caps the response body accumulated for any
+// live metadata fetch. The Prometheus /api/v1/labels endpoint
+// typically returns a few KiB; this ceiling defends against a
+// misbehaving upstream returning an unbounded body.
 const schemaContextMaxBytes = 1 << 20 // 1 MiB
 
 // schemaContextMaxLabels caps the number of labels/metrics/streams
@@ -102,14 +114,14 @@ const schemaContextMaxLabels = 64
 //  3. Build the base (static) hints for the resolved type — these
 //     are the deterministic fallback used by the LLM prompt when
 //     the live fetch fails or returns nothing useful.
-//  4. Attempt the live metadata fetch over HTTP. On success, merge
-//     the live results into the base hints (deduplicated, capped).
-//     On failure, return the base hints alongside a SOFT error so
-//     Translate can attach a Warnings entry.
+//  4. Attempt the live metadata fetch via CallResource. On success,
+//     merge the live results into the base hints (deduplicated,
+//     capped). On failure, return the base hints alongside a SOFT
+//     error so Translate can attach a Warnings entry.
 //
 // Parameters:
 //   - ctx:   request-scoped context propagated into the datasource
-//     lookup AND the live HTTP fetch so a client cancellation
+//     lookup AND the CallResource call so a client cancellation
 //     aborts cleanly.
 //   - req:   the validated TranslateRequest. DatasourceUID and
 //     DatasourceType are read from this struct; NaturalLanguage is
@@ -118,6 +130,11 @@ const schemaContextMaxLabels = 64
 //     caller (PostTranslate in translate.go) MUST derive this from
 //     c.GetOrgID() — never from the request body — so a client
 //     cannot spoof another organization's datasource.
+//   - user:  the authenticated caller's identity envelope. Forwarded
+//     into plugin-context construction so the plugin runtime can
+//     attach the caller's identity to any downstream auth checks
+//     and (for OAuth-forwarding datasources) the upstream HTTP
+//     request. May be nil for service-mode callers.
 //
 // Returns:
 //   - On HARD failure: (SchemaContext{}, error wrapping
@@ -127,7 +144,7 @@ const schemaContextMaxLabels = 64
 //   - On success: (mergedSchemaContext, nil). The merged context
 //     contains the base hints supplemented by any successful live
 //     fetch results.
-func (s *Service) fetchSchemaContext(ctx context.Context, req TranslateRequest, orgID int64) (SchemaContext, error) {
+func (s *Service) fetchSchemaContext(ctx context.Context, req TranslateRequest, orgID int64, user identity.Requester) (SchemaContext, error) {
 	// Step 1: Verify the datasource exists and is accessible by this org.
 	//
 	// SECURITY (AAP §0.8.5): only the datasource UID and orgID are
@@ -184,10 +201,10 @@ func (s *Service) fetchSchemaContext(ctx context.Context, req TranslateRequest, 
 	// the seed corpus that the live fetch augments on success.
 	base := buildBaseSchemaContext(claimedType)
 
-	// Step 4: Attempt the live metadata fetch. On any failure here,
-	// return the base hints alongside a SOFT error so Translate
-	// downgrades it to a warning.
-	live, fetchErr := s.fetchLiveSchema(ctx, ds, claimedType)
+	// Step 4: Attempt the live metadata fetch via CallResource. On
+	// any failure here, return the base hints alongside a SOFT
+	// error so Translate downgrades it to a warning.
+	live, fetchErr := s.fetchLiveSchema(ctx, ds, claimedType, user)
 	if fetchErr != nil {
 		s.log.Debug("NLQ feature: live schema metadata fetch failed (soft error)",
 			"datasourceUID", req.DatasourceUID,
@@ -211,78 +228,85 @@ func (s *Service) fetchSchemaContext(ctx context.Context, req TranslateRequest, 
 	return mergeSchemaContexts(base, live), nil
 }
 
-// fetchLiveSchema issues HTTP calls against the datasource backend
-// to retrieve real label names (and metric names for Prometheus).
+// fetchLiveSchema issues CallResource RPCs against the datasource's
+// plugin backend to retrieve real label names (and metric names for
+// Prometheus).
 //
-// SECURITY (AAP §0.8.5):
-//   - The HTTP request uses ds.URL composed with a fixed path
-//     suffix; no caller-supplied content is embedded in the URL.
-//   - When ds.BasicAuth is true, ds.BasicAuthPassword is read
-//     directly into the http.Request's BasicAuth field and never
-//     logged. The local variable falls out of scope when the
-//     function returns.
-//   - Transport errors are returned to the caller; only sanitized
-//     fields appear in the log lines emitted here.
-//   - The function NEVER logs ds.URL in full (only the host via
-//     safeHost) to avoid leaking embedded credentials from
-//     pathological URL configurations.
+// CallResource routes the call through the full plugin runtime
+// transport chain (secureSocksProxy, TLS client-cert auth, OAuth
+// identity forwarding, custom headers, basic-auth and SecureJsonData
+// credential handling), so deployments that depend on those features
+// see their datasource requests respected — unlike the prior direct
+// HTTP implementation which bypassed every plugin middleware.
 //
 // dsType is expected to be already normalized (TrimSpace + ToLower)
-// and to be one of "prometheus", "mimir", or "loki".
+// and to be one of "prometheus", "mimir", or "loki". The plugin ID
+// passed to GetWithDataSource is ds.Type (the registered plugin
+// identifier on the datasource record) — this is correct because
+// Mimir datasources in Grafana are typically registered against the
+// "prometheus" plugin while exposing the Mimir-compatible endpoint.
+//
+// SECURITY (AAP §0.8.5):
+//   - The plugin context envelope is opaque; no credential value
+//     touched by this function.
+//   - The CallResource sender accumulates response bytes up to
+//     schemaContextMaxBytes and ignores everything beyond.
+//   - The full upstream URL is never constructed in this file; the
+//     plugin runtime composes it from ds.URL + path suffix.
+//   - Errors returned to the caller contain only the path and
+//     status code; never the body or any credential material.
 //
 // Returns:
 //   - (live SchemaContext, nil) on success. live contains whatever
 //     was successfully retrieved; partial successes (labels OK,
 //     metrics fail) are accepted — only label retrieval is required
 //     for the result to be considered useful.
-//   - (SchemaContext{}, error) on hard fetch failure (DNS, 5xx,
-//     malformed JSON, etc.). The error is suitable for inclusion
-//     in a SOFT-failure Warnings entry.
-func (s *Service) fetchLiveSchema(ctx context.Context, ds *datasources.DataSource, dsType string) (SchemaContext, error) {
+//   - (SchemaContext{}, error) on hard fetch failure. The error is
+//     suitable for inclusion in a SOFT-failure Warnings entry.
+func (s *Service) fetchLiveSchema(ctx context.Context, ds *datasources.DataSource, dsType string, user identity.Requester) (SchemaContext, error) {
 	if ds == nil {
 		return SchemaContext{}, errors.New("nil datasource")
 	}
-	baseURL := strings.TrimRight(ds.URL, "/")
-	if baseURL == "" {
-		// Without a base URL we cannot issue any live call. Return
-		// an error so the caller surfaces a Warnings entry.
-		return SchemaContext{}, errors.New("datasource URL is empty")
+	if s.pluginClient == nil || s.pluginContext == nil {
+		// Defense-in-depth: a unit-test fixture that did not wire
+		// the plugin client / plugin-context provider falls through
+		// to base hints rather than panicking.
+		return SchemaContext{}, errors.New("plugin runtime not configured")
 	}
 
 	var live SchemaContext
 
 	switch dsType {
 	case "prometheus", "mimir":
-		// Fetch label names from /api/v1/labels. This is the
+		// Fetch label names from "api/v1/labels". This is the
 		// canonical Prometheus label-catalogue endpoint (see
 		// pkg/promlib/resource/resource.go which proxies the same
 		// upstream contract).
-		labels, err := s.fetchPromLabelsResource(ctx, ds, baseURL+"/api/v1/labels")
+		labels, err := s.callDatasourceResource(ctx, ds, user, "api/v1/labels")
 		if err != nil {
 			return SchemaContext{}, fmt.Errorf("prometheus labels fetch: %w", err)
 		}
 		live.Labels = capStringSlice(labels, schemaContextMaxLabels)
 
-		// Fetch metric names from /api/v1/label/__name__/values.
+		// Fetch metric names from "api/v1/label/__name__/values".
 		// This is a best-effort enrichment: if it fails, we still
 		// return the labels (so the caller can decide whether the
 		// partial result is useful).
-		if metrics, err := s.fetchPromLabelsResource(ctx, ds, baseURL+"/api/v1/label/__name__/values"); err == nil {
+		if metrics, err := s.callDatasourceResource(ctx, ds, user, "api/v1/label/__name__/values"); err == nil {
 			live.Metrics = capStringSlice(metrics, schemaContextMaxLabels)
 		} else {
 			// Log at debug only; the labels result is still useful.
 			s.log.Debug("NLQ feature: prometheus metric names fetch failed (partial success)",
-				"host", safeHost(baseURL),
+				"host", safeHost(ds.URL),
 				"err", err,
 			)
 		}
 		return live, nil
 
 	case "loki":
-		// Fetch label names from /loki/api/v1/labels. See
-		// pkg/tsdb/loki/api.go which proxies the same upstream
-		// contract.
-		labels, err := s.fetchPromLabelsResource(ctx, ds, baseURL+"/loki/api/v1/labels")
+		// Fetch label names from "loki/api/v1/labels". See
+		// pkg/tsdb/loki/api.go which serves the same contract.
+		labels, err := s.callDatasourceResource(ctx, ds, user, "loki/api/v1/labels")
 		if err != nil {
 			return SchemaContext{}, fmt.Errorf("loki labels fetch: %w", err)
 		}
@@ -301,71 +325,114 @@ func (s *Service) fetchLiveSchema(ctx context.Context, ds *datasources.DataSourc
 	}
 }
 
-// fetchPromLabelsResource issues a GET against the supplied URL
-// (which the caller has already constructed as <ds.URL><path>),
-// parses the response body as the canonical Prometheus
-// "labelValuesResponse" shape — `{"status":"success","data":[...]}` —
-// and returns the data slice.
+// callDatasourceResource issues a GET CallResource RPC at the
+// supplied path against the datasource's plugin backend and parses
+// the response body as the canonical Prometheus / Loki labels
+// envelope: `{"status":"success","data":["label1","label2",...]}`.
 //
 // This shape is shared between Prometheus's /api/v1/labels endpoint
 // and Loki's /loki/api/v1/labels endpoint (Loki copies the
 // Prometheus response envelope), so a single helper covers both.
 //
 // SECURITY (AAP §0.8.5):
-//   - The full request URL is intentionally NOT returned in error
-//     messages. Errors echo only the response status code and a
-//     generic class identifier; the host is logged via safeHost.
-//   - BasicAuth credentials, when configured on the datasource,
-//     are attached to the request via the standard library's
-//     BasicAuth method and NEVER appear in any returned error
-//     message or log line emitted by this function.
-//   - The response body read is bounded by schemaContextMaxBytes
+//   - The CallResource RPC carries no NLQ-specific secrets — the
+//     LLM API key is read only inside translate.go's callLLM.
+//   - Plugin-context construction uses GetWithDataSource which
+//     attaches decrypted SecureJsonData (when permitted) to the
+//     context envelope. The decrypted values flow through the
+//     plugin runtime; this function never reads them directly.
+//   - Errors returned are bounded to the path identifier and the
+//     status code; never the response body content.
+//   - Response bodies are accumulated up to schemaContextMaxBytes
 //     to defend against unbounded upstream responses.
-func (s *Service) fetchPromLabelsResource(ctx context.Context, ds *datasources.DataSource, fullURL string) ([]string, error) {
-	if s.httpClient == nil {
-		return nil, errors.New("nil http client")
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-	if err != nil {
-		// SECURITY: NewRequestWithContext errors mention the URL
-		// in their message. Replace with a sanitized identifier.
-		return nil, fmt.Errorf("build request: %s", sanitizeTransportError(err))
-	}
-	httpReq.Header.Set("Accept", "application/json")
-	// Attach BasicAuth credentials if the datasource is so
-	// configured. ds.BasicAuthPassword is read here and never
-	// stored on the Service; it leaves scope when this function
-	// returns.
-	if ds.BasicAuth {
-		// In some Grafana deployments the BasicAuth password is
-		// stored in SecureJsonData rather than the BasicAuthPassword
-		// field. We do not attempt to decrypt SecureJsonData here
-		// (that requires the secrets service), so deployments that
-		// store credentials there will fall back to the SOFT
-		// failure path via 401 from the upstream. This is by design:
-		// expanding the dependency surface to include the secrets
-		// service exceeds the Minimal Change Clause budget.
-		httpReq.SetBasicAuth(ds.BasicAuthUser, ds.BasicAuthPassword)
+//
+// Returns:
+//   - On success: the data slice from the response envelope
+//     (potentially empty).
+//   - On failure: an error suitable for inclusion in a
+//     SOFT-failure Warnings entry. The error message contains the
+//     resource path and an upstream status code class — no
+//     response body and no credential material.
+func (s *Service) callDatasourceResource(ctx context.Context, ds *datasources.DataSource, user identity.Requester, path string) ([]string, error) {
+	if s.pluginClient == nil || s.pluginContext == nil {
+		return nil, errors.New("plugin runtime not configured")
 	}
 
-	httpResp, err := s.httpClient.Do(httpReq)
+	// Build the plugin context envelope. GetWithDataSource resolves
+	// the plugin record, attaches the datasource instance settings
+	// (including decrypted SecureJsonData), and includes the caller's
+	// identity. ds.Type is the registered plugin identifier; for
+	// Mimir-on-Prometheus deployments this is "prometheus" and the
+	// upstream endpoint is configured on ds.URL.
+	pCtx, err := s.pluginContext.GetWithDataSource(ctx, ds.Type, user, ds)
 	if err != nil {
-		return nil, fmt.Errorf("transport: %s", sanitizeTransportError(err))
+		// SECURITY: the error from GetWithDataSource contains no
+		// credentials (it indexes by plugin ID); pass through.
+		return nil, fmt.Errorf("plugin context: %w", err)
 	}
-	defer func() {
-		_ = httpResp.Body.Close()
-	}()
 
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+	req := &backend.CallResourceRequest{
+		PluginContext: pCtx,
+		Path:          path,
+		Method:        http.MethodGet,
+		URL:           path,
+		Headers: map[string][]string{
+			"Accept": {"application/json"},
+		},
+	}
+
+	// Accumulate the response body up to schemaContextMaxBytes.
+	// The plugin runtime may stream the response across multiple
+	// CallResourceResponse callbacks; we concatenate the Body
+	// slices and capture the first observed StatusCode. The cap
+	// is enforced inline so a runaway upstream cannot drive
+	// unbounded memory growth.
+	var (
+		collected  []byte
+		statusCode int
+	)
+	sender := backend.CallResourceResponseSenderFunc(func(r *backend.CallResourceResponse) error {
+		if r == nil {
+			return nil
+		}
+		if statusCode == 0 {
+			statusCode = r.Status
+		}
+		if len(r.Body) == 0 {
+			return nil
+		}
+		remaining := schemaContextMaxBytes - len(collected)
+		if remaining <= 0 {
+			// Already at the cap; drop further chunks.
+			return nil
+		}
+		body := r.Body
+		if len(body) > remaining {
+			body = body[:remaining]
+		}
+		collected = append(collected, body...)
+		return nil
+	})
+
+	if err := s.pluginClient.CallResource(ctx, req, sender); err != nil {
+		// SECURITY: the plugin runtime's error message describes
+		// the plugin / path / RPC class — never the response body
+		// or credential material. We safely pass it through.
+		return nil, fmt.Errorf("call resource %q: %w", path, err)
+	}
+
+	if statusCode != 0 && (statusCode < 200 || statusCode >= 300) {
 		// SECURITY: only the status code is included in the error.
 		// The response body of an error response from a third-party
 		// upstream may contain sensitive operator information.
-		return nil, fmt.Errorf("upstream returned status %d", httpResp.StatusCode)
+		return nil, fmt.Errorf("upstream resource %q returned status %d", path, statusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(httpResp.Body, schemaContextMaxBytes))
-	if err != nil {
-		return nil, fmt.Errorf("read body: %s", sanitizeTransportError(err))
+	if len(collected) == 0 {
+		// Empty body on a 2xx is treated as "no data". Return an
+		// empty slice rather than an error so the caller can
+		// proceed with base hints.
+		return nil, nil
 	}
 
 	// Canonical Prometheus / Loki response envelope:
@@ -374,11 +441,11 @@ func (s *Service) fetchPromLabelsResource(ctx context.Context, ds *datasources.D
 		Status string   `json:"status"`
 		Data   []string `json:"data"`
 	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+	if err := json.Unmarshal(collected, &envelope); err != nil {
+		return nil, fmt.Errorf("decode response for %q: %w", path, err)
 	}
 	if envelope.Status != "" && envelope.Status != "success" {
-		return nil, fmt.Errorf("upstream reported status %q", envelope.Status)
+		return nil, fmt.Errorf("upstream resource %q reported status %q", path, envelope.Status)
 	}
 	return envelope.Data, nil
 }
@@ -492,7 +559,7 @@ func buildBaseSchemaContext(dsType string) SchemaContext {
 }
 
 // mergeSchemaContexts combines a base SchemaContext (static, always
-// non-empty for supported types) with a live SchemaContext (HTTP
+// non-empty for supported types) with a live SchemaContext (CallResource
 // fetch result, may be empty for partial successes). The merge is:
 //
 //   - dedup-aware: a label/metric/stream present in both lists

@@ -962,7 +962,7 @@ func Initialize(ctx context.Context, cfg *setting.Cfg, opts Options, apiOpts api
 	}
 	ossUserProtectionImpl := authinfoimpl.ProvideOSSUserProtectionService()
 	registration := authnimpl.ProvideRegistration(cfg, authnService, orgService, userAuthTokenService, acimplService, permissionRegistry, apikeyService, userService, authService, ossUserProtectionImpl, loginattemptimplService, quotaService, authinfoimplService, renderingService, featureToggles, oauthtokenService, socialService, remoteCache, ldapImpl, ossImpl, tracingService, tempuserService, notificationService)
-	nlqService, err := nlq.ProvideService(cfg, routeRegisterImpl, service15, accessControl, featureToggles)
+	nlqService, err := nlq.ProvideService(cfg, routeRegisterImpl, service15, accessControl, featureToggles, middlewareHandler, plugincontextProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -1645,7 +1645,7 @@ func InitializeForTest(ctx context.Context, t sqlutil.ITestDB, testingT interfac
 	}
 	ossUserProtectionImpl := authinfoimpl.ProvideOSSUserProtectionService()
 	registration := authnimpl.ProvideRegistration(cfg, authnService, orgService, userAuthTokenService, acimplService, permissionRegistry, apikeyService, userService, authService, ossUserProtectionImpl, loginattemptimplService, quotaService, authinfoimplService, renderingService, featureToggles, oauthtokentestService, socialService, remoteCache, ldapImpl, ossImpl, tracingService, tempuserService, notificationServiceMock)
-	nlqService, err := nlq.ProvideService(cfg, routeRegisterImpl, service15, accessControl, featureToggles)
+	nlqService, err := nlq.ProvideService(cfg, routeRegisterImpl, service15, accessControl, featureToggles, middlewareHandler, plugincontextProvider)
 	if err != nil {
 		return nil, err
 	}

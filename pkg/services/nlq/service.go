@@ -38,17 +38,40 @@
 package nlq
 
 import (
+	"context"
 	"net/http"
 	"time"
 
+	"github.com/grafana/grafana-plugin-sdk-go/backend"
+
 	"github.com/grafana/grafana/pkg/api/routing"
+	"github.com/grafana/grafana/pkg/apimachinery/identity"
 	"github.com/grafana/grafana/pkg/infra/log"
 	"github.com/grafana/grafana/pkg/middleware"
+	"github.com/grafana/grafana/pkg/plugins"
 	ac "github.com/grafana/grafana/pkg/services/accesscontrol"
 	"github.com/grafana/grafana/pkg/services/datasources"
 	"github.com/grafana/grafana/pkg/services/featuremgmt"
+	"github.com/grafana/grafana/pkg/services/pluginsintegration/plugincontext"
 	"github.com/grafana/grafana/pkg/setting"
 )
+
+// pluginContextProvider is the narrow interface the NLQ service
+// requires from the plugin-context subsystem. Declared here (not
+// imported from pluginsintegration/plugincontext) so unit tests
+// can supply a lightweight fake without dragging in the full
+// concrete provider's dependency chain.
+//
+// The single method matches the signature of
+// plugincontext.Provider.GetWithDataSource verbatim so the concrete
+// type is assignable to this interface without any adapter.
+//
+// SECURITY (AAP §0.8.5): the implementation MUST NEVER receive or
+// produce values containing the LLM API key. The signature deliberately
+// has no API-key parameter or return.
+type pluginContextProvider interface {
+	GetWithDataSource(ctx context.Context, pluginID string, user identity.Requester, ds *datasources.DataSource) (backend.PluginContext, error)
+}
 
 // llmHTTPTimeout caps the duration of any single outbound LLM provider
 // HTTP request. 30 seconds matches the agent-prompt specification and
@@ -140,6 +163,41 @@ type Service struct {
 	// http.NewRequestWithContext so request-scoped context
 	// cancellation propagates as a secondary cancellation signal.
 	httpClient *http.Client
+
+	// pluginClient is the in-process plugin runtime gateway used by
+	// schema_context.go's fetchLiveSchema to retrieve real datasource
+	// metadata (label names, metric names, log-stream label names)
+	// via the canonical CallResource RPC.
+	//
+	// Why CallResource instead of a direct HTTP call:
+	// The plugin client routes the request through the full datasource
+	// transport chain — secureSocksProxy, TLS client-cert auth,
+	// OAuth identity forwarding, custom headers, basic-auth (including
+	// SecureJsonData-stored credentials), TLS configuration, plugin
+	// middleware, and request-context propagation. A direct
+	// http.Client.Do bypasses every one of these features and breaks
+	// in deployments that rely on them (NLQ feature MAJOR review
+	// finding — schema_context.go integration).
+	//
+	// Wire-bound to *backend.MiddlewareHandler at
+	// pkg/services/pluginsintegration/pluginsintegration.go:L153
+	// via `wire.Bind(new(plugins.Client), new(*backend.MiddlewareHandler))`.
+	pluginClient plugins.Client
+
+	// pluginContext provides datasource-aware backend.PluginContext
+	// values consumed by every CallResource call. Built by
+	// GetWithDataSource which resolves the plugin record, attaches
+	// the datasource instance settings (including decrypted
+	// SecureJsonData when permitted), and constructs the user
+	// identity envelope.
+	//
+	// Provided concretely as *plugincontext.Provider by Wire DI;
+	// stored here through the narrow pluginContextProvider interface
+	// so the NLQ service unit tests can substitute a lightweight
+	// fake without dragging in the full plugincontext concrete
+	// dependency chain (pluginstore, datasource cache, secrets,
+	// plugin settings cache).
+	pluginContext pluginContextProvider
 }
 
 // ProvideService is the Wire DI constructor for the NLQ service.
@@ -154,14 +212,14 @@ type Service struct {
 // Construction order:
 //  1. Build the Service struct with the injected dependencies in
 //     their canonical field order (cfg, routeRegister, dsService,
-//     ac, features, log, httpClient).
+//     ac, features, log, httpClient, pluginClient, pluginContext).
 //  2. Instantiate the named logger via log.New("nlq") — matches the
 //     pattern in pkg/services/correlations/correlations.go.
 //  3. Instantiate the shared HTTP client with the package-level
 //     llmHTTPTimeout. The client is reused across all requests for
 //     connection pooling.
-//  4. Register the HTTP route only when the nlqEnabled feature flag
-//     is enabled globally (AAP §0.6.1.1). When the flag is off, no
+//  4. Register the HTTP route when the nlqEnabled feature toggle is
+//     enabled globally (AAP §0.6.1.1). When the toggle is off, no
 //     /api/nlq/* route is mounted on the server; this makes the
 //     deployment exactly equivalent to baseline Grafana, satisfying
 //     the Minimal Change Clause (AAP §0.8.1).
@@ -170,6 +228,25 @@ type Service struct {
 //     disabled — so dependents that hold a *Service reference can
 //     rely on it being usable for non-HTTP callers (currently none,
 //     but reserved for future extension).
+//
+// Feature gate harmonization (review feedback MAJOR finding):
+// The previous design required BOTH cfg.NLQEnabled AND the
+// nlqEnabled feature toggle for route registration. The frontend,
+// however, gates only on the feature toggle. With a toggle-on /
+// cfg-off configuration the panel editor rendered the NLQ bar but
+// /api/nlq/translate returned 404 — a confusing user experience.
+//
+// The corrected design registers the route whenever the feature
+// toggle is enabled, regardless of cfg.NLQEnabled. The cfg.NLQEnabled
+// gate is now consulted inside the handler: when it is false,
+// PostTranslate / Translate short-circuit with ErrServiceDisabled
+// (HTTP 503 Service Unavailable) — a clear, localizable signal that
+// the frontend can render through its existing Alert surface. This
+// matches the resolution guidance in the review findings:
+// "register the route whenever the frontend flag can render and have
+// the handler return a localized disabled response when
+// `[nlq] enabled=false`. Ensure config comments, backend behavior,
+// and frontend behavior match."
 //
 // Errors: this constructor returns no error today. The error return
 // is retained for forward compatibility with Wire's expectation of
@@ -185,6 +262,8 @@ func ProvideService(
 	dsService datasources.DataSourceService,
 	accessControl ac.AccessControl,
 	features featuremgmt.FeatureToggles,
+	pluginClient plugins.Client,
+	pluginCtx *plugincontext.Provider,
 ) (*Service, error) {
 	// Construct the Service in one literal so the field bindings stay
 	// adjacent to the struct definition and are easy to audit during
@@ -202,23 +281,45 @@ func ProvideService(
 			// so client disconnects propagate.
 			Timeout: llmHTTPTimeout,
 		},
+		// NLQ feature: plugin client + plugin-context provider drive
+		// the live schema-metadata fetch through the canonical
+		// Grafana datasource transport chain (CallResource). See the
+		// schema_context.go file comment and the field-level comments
+		// above for the security and integration rationale.
+		pluginClient: pluginClient,
 	}
 
-	// NLQ feature: gate route registration on BOTH gates (per
-	// conf/defaults.ini comment and AAP §0.6.3.1):
-	//   1. cfg.NLQEnabled — the operator kill switch from
-	//      [nlq] enabled (env GF_NLQ_ENABLED). Allows operators to
-	//      disable the feature even when the feature flag is on, e.g.
-	//      to take the LLM endpoint down for maintenance.
-	//   2. featuremgmt.FlagNlqEnabled — the feature toggle from
-	//      pkg/services/featuremgmt/registry.go. The canonical
-	//      "is this feature shipped" gate that the frontend also
-	//      checks via config.featureToggles.nlqEnabled.
+	// NLQ feature: avoid the Go "nil interface trap" when a caller
+	// (e.g. an integration test) passes a nil *plugincontext.Provider.
+	// Assigning a typed-nil pointer to the pluginContextProvider
+	// interface field would yield a non-nil interface value whose
+	// dynamic type is *plugincontext.Provider and whose dynamic value
+	// is nil. Subsequent `s.pluginContext == nil` checks in
+	// schema_context.go would then evaluate to FALSE and a downstream
+	// method call would panic. By collapsing a nil concrete pointer to
+	// a nil interface here, we make `s.pluginContext == nil` behave
+	// intuitively for both production (concrete provider supplied by
+	// Wire) and test (caller passes nil to opt out of live schema
+	// fetch) call sites. The defensive nil-check in
+	// schema_context.go's fetchLiveSchema then steers the schema fetch
+	// into the SOFT-failure path that returns base hints + a Warnings
+	// entry — exactly the behavior the integration tests assert
+	// against.
+	if pluginCtx != nil {
+		s.pluginContext = pluginCtx
+	}
+
+	// NLQ feature (review feedback MAJOR — feature gate harmonization):
+	// Register the HTTP route whenever the nlqEnabled feature toggle
+	// is enabled globally. The cfg.NLQEnabled (operator kill switch)
+	// gate is enforced inside the handler via ErrServiceDisabled
+	// (HTTP 503), giving the frontend a clear localized error to
+	// render without ever exposing a 404 to a user who sees the bar.
 	//
-	// When either gate is off, no /api/nlq/* route is mounted — this
-	// ensures the server is exactly equivalent to baseline Grafana
-	// when the feature is disabled, satisfying the Minimal Change
-	// Clause (AAP §0.8.1) and the off-by-default requirement
+	// When the feature toggle is OFF, no /api/nlq/* route is mounted —
+	// this ensures the server is exactly equivalent to baseline
+	// Grafana when the feature is disabled, satisfying the Minimal
+	// Change Clause (AAP §0.8.1) and the off-by-default requirement
 	// (AAP §0.1.1).
 	//
 	// We use IsEnabledGlobally because nlqEnabled is an operator-
@@ -237,19 +338,23 @@ func ProvideService(
 	return s, nil
 }
 
-// routeRegistrationEnabled reports whether BOTH the [nlq] enabled
-// ini gate AND the nlqEnabled feature toggle are on. Extracted from
-// ProvideService as a tiny helper so the dual-gate contract is easy
-// to audit and easy to unit-test in isolation. Both inputs are
-// snapshot-read from the construction-time values; route registration
+// routeRegistrationEnabled reports whether the nlqEnabled feature
+// toggle is on. Extracted from ProvideService as a tiny helper so the
+// gate contract is easy to audit and easy to unit-test in isolation.
+// The result is snapshot-read at construction time; route registration
 // never changes after server startup so re-reading the gates per
 // request would not change behavior.
 //
+// NOTE (review feedback MAJOR — feature gate harmonization):
+// cfg.NLQEnabled is deliberately NOT consulted here. That gate is now
+// enforced inside the handler (Translate → ErrServiceDisabled → 503)
+// so the frontend, which is gated only on the feature toggle, never
+// encounters a 404 when the operator has cfg-disabled the feature
+// while leaving the toggle on. See the ProvideService docstring for
+// the full rationale.
+//
 //nolint:staticcheck // not yet migrated to OpenFeature
 func (s *Service) routeRegistrationEnabled() bool {
-	if s.cfg == nil || !s.cfg.NLQEnabled {
-		return false
-	}
 	if s.features == nil {
 		return false
 	}

@@ -58,6 +58,14 @@ import type { DataSourceInstanceSettings } from '@grafana/data';
 import { config } from '@grafana/runtime';
 import type { SceneObjectRef, VizPanel } from '@grafana/scenes';
 
+// `parseCssLengthToPx` is a pure helper exported alongside `NLQQueryPreview`.
+// Its tests live in this file (and not in a standalone `NLQQueryPreview.test.tsx`)
+// because the AAP §0.3.2.2 explicitly lists only two frontend test files in
+// scope: this file and `useNLQTranslation.test.ts`. Consolidating the helper
+// tests here keeps the test inventory aligned with the AAP-approved scope per
+// Checkpoint 4 review feedback ("Either add the file to the formal scope or
+// remove/consolidate this test coverage into an in-scope test file").
+import { parseCssLengthToPx } from './NLQQueryPreview';
 import { NaturalLanguageQueryBar } from './NaturalLanguageQueryBar';
 
 // ---------------------------------------------------------------------------
@@ -223,6 +231,25 @@ const panelRefStub = {
 } as unknown as SceneObjectRef<VizPanel>;
 
 /**
+ * Required-callback stubs. As of Checkpoint 4 review feedback (C3), the
+ * `NaturalLanguageQueryBar` declares `onRun` and `onAddPanel` as REQUIRED
+ * props — making them optional caused the production call site to silently
+ * no-op when callbacks were omitted. Tests that do not exercise the
+ * callbacks themselves still need to satisfy the type contract, so each
+ * `render()` call passes a fresh `jest.fn()` pair from this helper.
+ *
+ * Returning fresh mocks per call (instead of module-level constants)
+ * guarantees that call counts from prior tests cannot bleed into the
+ * current test's assertions if jest module isolation ever weakens.
+ */
+function makeCallbackStubs() {
+  return {
+    onRun: jest.fn(),
+    onAddPanel: jest.fn(),
+  };
+}
+
+/**
  * Default MSW handler factory for the happy-path `POST /api/nlq/translate`
  * endpoint. Returns a PromQL response for Prometheus datasources and a
  * LogQL response for Loki datasources, mirroring the production server
@@ -278,7 +305,15 @@ describe('NaturalLanguageQueryBar', () => {
     it('renders nothing when config.featureToggles.nlqEnabled is false', () => {
       config.featureToggles.nlqEnabled = false;
 
-      render(<NaturalLanguageQueryBar dsSettings={makeDsSettings('prometheus')} panelRef={panelRefStub} />);
+      const cb = makeCallbackStubs();
+      render(
+        <NaturalLanguageQueryBar
+          dsSettings={makeDsSettings('prometheus')}
+          panelRef={panelRefStub}
+          onRun={cb.onRun}
+          onAddPanel={cb.onAddPanel}
+        />
+      );
 
       // The component returns `null` when the flag is off, so neither the
       // outer wrapper (`data-testid="nlq-bar"`) nor any of the visible
@@ -292,7 +327,15 @@ describe('NaturalLanguageQueryBar', () => {
     // catch regressions in either the test-id contract or the i18n default
     // string.
     it('renders the collapsible section when nlqEnabled is true', () => {
-      render(<NaturalLanguageQueryBar dsSettings={makeDsSettings('prometheus')} panelRef={panelRefStub} />);
+      const cb = makeCallbackStubs();
+      render(
+        <NaturalLanguageQueryBar
+          dsSettings={makeDsSettings('prometheus')}
+          panelRef={panelRefStub}
+          onRun={cb.onRun}
+          onAddPanel={cb.onAddPanel}
+        />
+      );
 
       expect(screen.getByTestId('nlq-bar')).toBeInTheDocument();
       expect(screen.getByText('Ask a question')).toBeInTheDocument();
@@ -311,7 +354,15 @@ describe('NaturalLanguageQueryBar', () => {
       registerHappyPathHandler();
       const user = userEvent.setup();
 
-      render(<NaturalLanguageQueryBar dsSettings={makeDsSettings('prometheus')} panelRef={panelRefStub} />);
+      const cb = makeCallbackStubs();
+      render(
+        <NaturalLanguageQueryBar
+          dsSettings={makeDsSettings('prometheus')}
+          panelRef={panelRefStub}
+          onRun={cb.onRun}
+          onAddPanel={cb.onAddPanel}
+        />
+      );
 
       // Open the collapsible — `CollapsableSection` mounts the children
       // lazily, so the input is not in the DOM until the user expands.
@@ -348,7 +399,15 @@ describe('NaturalLanguageQueryBar', () => {
       registerHappyPathHandler();
       const user = userEvent.setup();
 
-      render(<NaturalLanguageQueryBar dsSettings={makeDsSettings('loki')} panelRef={panelRefStub} />);
+      const cb = makeCallbackStubs();
+      render(
+        <NaturalLanguageQueryBar
+          dsSettings={makeDsSettings('loki')}
+          panelRef={panelRefStub}
+          onRun={cb.onRun}
+          onAddPanel={cb.onAddPanel}
+        />
+      );
 
       await user.click(screen.getByRole('button', { name: /Ask a question/i }));
       const input = await screen.findByTestId('nlq-bar-input');
@@ -376,7 +435,15 @@ describe('NaturalLanguageQueryBar', () => {
 
       const user = userEvent.setup();
 
-      render(<NaturalLanguageQueryBar dsSettings={makeDsSettings('prometheus')} panelRef={panelRefStub} />);
+      const cb = makeCallbackStubs();
+      render(
+        <NaturalLanguageQueryBar
+          dsSettings={makeDsSettings('prometheus')}
+          panelRef={panelRefStub}
+          onRun={cb.onRun}
+          onAddPanel={cb.onAddPanel}
+        />
+      );
 
       await user.click(screen.getByRole('button', { name: /Ask a question/i }));
       const input = await screen.findByTestId('nlq-bar-input');
@@ -414,7 +481,15 @@ describe('NaturalLanguageQueryBar', () => {
 
       const user = userEvent.setup();
 
-      render(<NaturalLanguageQueryBar dsSettings={makeDsSettings('mysql')} panelRef={panelRefStub} />);
+      const cb = makeCallbackStubs();
+      render(
+        <NaturalLanguageQueryBar
+          dsSettings={makeDsSettings('mysql')}
+          panelRef={panelRefStub}
+          onRun={cb.onRun}
+          onAddPanel={cb.onAddPanel}
+        />
+      );
 
       // The bar renders in its collapsed state initially; opening it
       // reveals the unsupported-datasource alert in place of the input UI.
@@ -446,12 +521,14 @@ describe('NaturalLanguageQueryBar', () => {
     it('invokes onAddPanel with the translated query and language', async () => {
       registerHappyPathHandler();
       const onAddPanel = jest.fn();
+      const onRun = jest.fn();
       const user = userEvent.setup();
 
       render(
         <NaturalLanguageQueryBar
           dsSettings={makeDsSettings('prometheus')}
           panelRef={panelRefStub}
+          onRun={onRun}
           onAddPanel={onAddPanel}
         />
       );
@@ -482,5 +559,110 @@ describe('NaturalLanguageQueryBar', () => {
       });
       expect(onAddPanel).toHaveBeenCalledTimes(1);
     });
+
+    // AAP §0.6.4 criterion #3 (in spirit): when the user clicks "Run" after a
+    // successful translation, the `onRun` callback MUST be invoked with the
+    // (possibly user-edited) translated query and the resolved language. This
+    // is symmetric to the "Add as Panel" callback assertion above and exists
+    // because both callbacks are now REQUIRED props per Checkpoint 4 review
+    // (C3) — the previous optional-with-no-op contract caused the integrated
+    // Run/Add-as-Panel buttons to silently no-op in production.
+    it('invokes onRun with the translated query and language', async () => {
+      registerHappyPathHandler();
+      const onAddPanel = jest.fn();
+      const onRun = jest.fn();
+      const user = userEvent.setup();
+
+      render(
+        <NaturalLanguageQueryBar
+          dsSettings={makeDsSettings('prometheus')}
+          panelRef={panelRefStub}
+          onRun={onRun}
+          onAddPanel={onAddPanel}
+        />
+      );
+
+      await user.click(screen.getByRole('button', { name: /Ask a question/i }));
+      const input = await screen.findByTestId('nlq-bar-input');
+      await user.type(input, 'Graph total API request rate by endpoint over the last 24 hours');
+      await user.click(screen.getByTestId('nlq-bar-translate-button'));
+
+      // Wait for the preview before clicking Run.
+      await screen.findByTestId('nlq-mock-code-editor');
+
+      // The Run button lives in `NLQQueryPreview`. Its accessible name is
+      // localised via `<Trans>` and resolves to "Run" in the test env.
+      await user.click(screen.getByRole('button', { name: /^Run$/i }));
+
+      // The callback receives the unedited translated query and the PromQL
+      // language discriminator. `onAddPanel` MUST NOT be invoked by a Run
+      // click — the two actions are independent.
+      await waitFor(() => {
+        expect(onRun).toHaveBeenCalledWith('rate(http_requests_total[5m])', 'promql');
+      });
+      expect(onRun).toHaveBeenCalledTimes(1);
+      expect(onAddPanel).not.toHaveBeenCalled();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Helper unit tests: parseCssLengthToPx (from NLQQueryPreview)
+// ---------------------------------------------------------------------------
+//
+// These tests are colocated here (rather than in a separate
+// `NLQQueryPreview.test.tsx`) per Checkpoint 4 review feedback — the AAP
+// §0.3.2.2 explicitly lists only `NaturalLanguageQueryBar.test.tsx` and
+// `useNLQTranslation.test.ts` as in-scope frontend test files. The helper
+// is tested directly because Monaco's `CodeEditor` accepts a numeric
+// pixel `fontSize` / `lineHeight` / `padding` / `height`, whereas the
+// GrafanaTheme2 token values are strings like `"12px"` or `"0.75rem"`. A
+// regression in the parser would silently fall back to the default pixel
+// constants, defeating the design-system fix that resolves the MINOR
+// "hardcoded Monaco values must use GrafanaTheme2 tokens" finding — so
+// the parser invariants are pinned with direct unit tests.
+describe('parseCssLengthToPx', () => {
+  it('parses a pixel string like "12px"', () => {
+    expect(parseCssLengthToPx('12px', 99)).toBe(12);
+  });
+
+  it('parses a fractional pixel string like "13.5px"', () => {
+    expect(parseCssLengthToPx('13.5px', 99)).toBe(13.5);
+  });
+
+  it('parses a rem string using the standard 16px-per-rem ratio', () => {
+    // 0.75rem * 16 == 12px
+    expect(parseCssLengthToPx('0.75rem', 99)).toBe(12);
+  });
+
+  it('parses a whitespace-padded value', () => {
+    expect(parseCssLengthToPx('  14px  ', 99)).toBe(14);
+  });
+
+  it('parses a bare numeric string as pixels', () => {
+    expect(parseCssLengthToPx('16', 99)).toBe(16);
+  });
+
+  it('passes through a numeric input unchanged', () => {
+    expect(parseCssLengthToPx(20, 99)).toBe(20);
+  });
+
+  it('falls back to the default when value is undefined', () => {
+    expect(parseCssLengthToPx(undefined, 99)).toBe(99);
+  });
+
+  it('falls back to the default for an unrecognised unit', () => {
+    // "12em" is intentionally NOT supported — em depends on the parent
+    // font size which Monaco cannot compute. The fallback prevents the
+    // helper from silently producing a nonsense pixel count.
+    expect(parseCssLengthToPx('12em', 99)).toBe(99);
+  });
+
+  it('falls back to the default for a non-numeric string', () => {
+    expect(parseCssLengthToPx('not-a-length', 99)).toBe(99);
+  });
+
+  it('falls back to the default for NaN inputs', () => {
+    expect(parseCssLengthToPx(NaN, 99)).toBe(99);
   });
 });

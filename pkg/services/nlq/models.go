@@ -128,6 +128,7 @@ type SchemaContext struct {
 //	ErrUnsupportedDatasource -> 400 Bad Request
 //	ErrInvalidDatasource     -> 400 Bad Request
 //	ErrForbiddenDatasource   -> 403 Forbidden
+//	ErrServiceDisabled       -> 503 Service Unavailable
 //	ErrMissingAPIKey         -> 500 Internal Server Error
 //	ErrLLMUnavailable        -> 502 Bad Gateway
 //	ErrInvalidQuerySyntax    -> 502 Bad Gateway (the upstream LLM produced an unusable query)
@@ -192,6 +193,30 @@ var (
 	// be confused with the route-level signed-in check, which fires
 	// before the handler ever runs.
 	ErrForbiddenDatasource = errors.New("nlq: caller is not authorized to query this datasource")
+
+	// ErrServiceDisabled is returned when the operator-controlled
+	// [nlq] enabled ini gate is false (or GF_NLQ_ENABLED=false in
+	// the environment) at translate time. PostTranslate surfaces
+	// this as a 503 Service Unavailable.
+	//
+	// REVIEW FEEDBACK MAJOR — feature gate harmonization:
+	// The previous design coupled this gate to route registration
+	// (no route mounted when cfg.NLQEnabled was false). That caused
+	// a 404 when the feature toggle was enabled but the operator had
+	// disabled the cfg gate — the frontend (which is gated only on
+	// the toggle) rendered the bar but every translate call 404'd.
+	//
+	// The corrected design registers the route on the feature
+	// toggle only and uses THIS sentinel as a clear, localizable
+	// signal that the operator has disabled the feature. The
+	// frontend renders the resulting Alert in place of a translated
+	// query, and the feature can be re-enabled without a server
+	// restart by editing the ini and reloading config.
+	//
+	// SECURITY: the sentinel message contains no operator-supplied
+	// configuration; it is a fixed string safe to include in the
+	// response envelope.
+	ErrServiceDisabled = errors.New("nlq: translation is disabled by the operator")
 
 	// ErrMissingAPIKey is returned when the GF_NLQ_LLM_API_KEY
 	// environment variable is unset or empty at translate time.
