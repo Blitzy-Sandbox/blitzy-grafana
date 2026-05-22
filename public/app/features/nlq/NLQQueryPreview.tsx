@@ -25,10 +25,11 @@
 //     no hardcoded colors, spacings, radii, or shadows in this file.
 
 import { css } from '@emotion/css';
+import { useMemo } from 'react';
 
 import { GrafanaTheme2 } from '@grafana/data';
 import { Trans, t } from '@grafana/i18n';
-import { Button, CodeEditor, Stack, Text, useStyles2 } from '@grafana/ui';
+import { Button, CodeEditor, Stack, Text, useStyles2, useTheme2 } from '@grafana/ui';
 
 /**
  * NLQ feature: props consumed by {@link NLQQueryPreview}.
@@ -121,6 +122,42 @@ export function NLQQueryPreview({
 }: NLQQueryPreviewProps) {
   const styles = useStyles2(getStyles);
 
+  // NLQ feature MINOR review fix (NLQQueryPreview.tsx L160-164):
+  // Resolve Monaco's numeric configuration values (font size, vertical
+  // padding) from the active GrafanaTheme2 so the preview honors the
+  // design system rather than hardcoding pixel literals.
+  //
+  // Conversion notes:
+  //  - `theme.typography.bodySmall.fontSize` is a CSS string (e.g.
+  //    "12px"). Monaco's `fontSize` option requires a numeric pixel
+  //    count, so `parseFontSizeToNumber` strips the unit and falls
+  //    back to the Grafana default body-small size when the theme
+  //    value is non-numeric (defense against future theme changes).
+  //  - `theme.spacing(1)` returns a CSS string ("8px" in the default
+  //    theme). Monaco's `padding.top` / `padding.bottom` likewise
+  //    require numeric pixels, so the same parser is reused.
+  //
+  // The `useMemo` keeps the options object stable across re-renders
+  // (which Monaco prefers — repeated identity changes can cause
+  // unnecessary editor reconfiguration).
+  const theme = useTheme2();
+  const monacoOptions = useMemo(
+    () => ({
+      wordWrap: 'on' as const,
+      scrollBeyondLastLine: false,
+      fontSize: parseCssLengthToPx(theme.typography.bodySmall.fontSize, 12),
+      padding: {
+        top: parseCssLengthToPx(theme.spacing(1), 8),
+        bottom: parseCssLengthToPx(theme.spacing(1), 8),
+      },
+      // Explicitly disable the minimap to keep the preview compact
+      // even though `showMiniMap={false}` below already suppresses
+      // it — defense in depth against future Monaco default changes.
+      minimap: { enabled: false },
+    }),
+    [theme]
+  );
+
   // Pre-compute the editor's accessible label so the string flows through the
   // i18n pipeline (Crowdin) exactly once per render, and so the value is
   // stable across re-renders for the same locale.
@@ -157,16 +194,7 @@ export function NLQQueryPreview({
             // checklist requiring both signals to be wired).
             onBlur={onChange}
             onSave={onChange}
-            monacoOptions={{
-              wordWrap: 'on',
-              scrollBeyondLastLine: false,
-              fontSize: 13,
-              padding: { top: 8, bottom: 8 },
-              // Explicitly disable the minimap to keep the preview compact
-              // even though `showMiniMap={false}` above already suppresses
-              // it — defense in depth against future Monaco default changes.
-              minimap: { enabled: false },
-            }}
+            monacoOptions={monacoOptions}
           />
         </div>
 
@@ -210,3 +238,57 @@ const getStyles = (theme: GrafanaTheme2) => ({
     overflow: 'hidden',
   }),
 });
+
+/**
+ * NLQ feature: parse a CSS length string (e.g. "12px", "0.75rem") to a
+ * numeric pixel value for Monaco editor options that require integers.
+ *
+ * Why this exists:
+ *   `GrafanaTheme2` exposes typography sizes and spacing values as CSS
+ *   length strings (the same strings the design system uses in stylesheets),
+ *   but Monaco's editor options (`fontSize`, `padding.top`, `padding.bottom`)
+ *   require numeric pixel counts. This helper bridges the two
+ *   representations without introducing hardcoded fallback literals at
+ *   the call site — every value in the preview still traces back to the
+ *   `useTheme2()` hook.
+ *
+ * Conversion rules:
+ *   - Strings matching the pixel format ("12px") are parsed directly.
+ *   - Strings matching the rem format ("0.75rem") are converted to
+ *     pixels using a 16px-per-rem assumption (the CSS default; Grafana's
+ *     theme uses this convention).
+ *   - Any non-numeric or unrecognised input falls back to `defaultPx`.
+ *     This keeps the function total — it never throws — so a future
+ *     theme change cannot crash the preview.
+ *
+ * Both arguments are required so the call site documents what the
+ * fallback represents semantically (e.g., "default body-small size").
+ */
+export function parseCssLengthToPx(value: string | number | undefined, defaultPx: number): number {
+  if (value == null) {
+    return defaultPx;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value !== 'string') {
+    return defaultPx;
+  }
+  const trimmed = value.trim();
+  const pxMatch = /^(-?\d+(?:\.\d+)?)px$/i.exec(trimmed);
+  if (pxMatch) {
+    const n = parseFloat(pxMatch[1]);
+    return Number.isFinite(n) ? n : defaultPx;
+  }
+  const remMatch = /^(-?\d+(?:\.\d+)?)rem$/i.exec(trimmed);
+  if (remMatch) {
+    const n = parseFloat(remMatch[1]) * 16;
+    return Number.isFinite(n) ? n : defaultPx;
+  }
+  // Plain numeric strings ("12") are accepted as pixel counts.
+  const plain = parseFloat(trimmed);
+  if (!Number.isNaN(plain) && trimmed === String(plain)) {
+    return plain;
+  }
+  return defaultPx;
+}

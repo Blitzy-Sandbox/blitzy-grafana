@@ -475,6 +475,17 @@ type Cfg struct {
 	// NLQ feature: configuration fields for the Natural Language Query translation service.
 	// API key is intentionally NOT included here — it is read at runtime exclusively
 	// from os.Getenv("GF_NLQ_LLM_API_KEY") inside pkg/services/nlq/translate.go.
+	//
+	// Field semantics:
+	//   - NLQEnabled: operator kill switch. When false, pkg/services/nlq.ProvideService skips
+	//     route registration even if the nlqEnabled feature toggle is on. BOTH gates must be
+	//     enabled for the /api/nlq/translate route to be live.
+	//   - NLQProvider: identifier of the LLM provider wire shape. Currently only "openai" is
+	//     fully supported. Other values fall back to OpenAI-compatible semantics with a
+	//     warning logged from readNLQSettings. Validated centrally so any future provider
+	//     branching can rely on the field being a known string.
+	//   - NLQEndpoint: the LLM chat-completions endpoint URL used by translate.go's callLLM.
+	//   - NLQModel: the LLM model identifier sent in the request body's "model" field.
 	NLQEnabled  bool
 	NLQProvider string
 	NLQEndpoint string
@@ -893,12 +904,30 @@ func (cfg *Cfg) readExpressionsSettings() {
 // The EnvKey convention below (GF_<SECTION>_<KEY>) automatically supports
 // GF_NLQ_ENABLED, GF_NLQ_LLM_PROVIDER, GF_NLQ_LLM_ENDPOINT, GF_NLQ_LLM_MODEL
 // as overrides for the ini-backed fields — no additional code is needed.
+//
+// Provider validation: the only fully supported provider in this release is
+// "openai" (or any OpenAI Chat Completions API compatible endpoint). Any
+// other value is preserved on the struct so future provider branching can
+// inspect it, but a warning is logged at startup so operators know the
+// configuration is being honored with OpenAI-shape semantics.
 func (cfg *Cfg) readNLQSettings() {
 	nlq := cfg.Raw.Section("nlq")
 	cfg.NLQEnabled = nlq.Key("enabled").MustBool(false)
 	cfg.NLQProvider = nlq.Key("llm_provider").MustString("openai")
 	cfg.NLQEndpoint = nlq.Key("llm_endpoint").MustString("https://api.openai.com/v1/chat/completions")
 	cfg.NLQModel = nlq.Key("llm_model").MustString("gpt-4o")
+
+	// NLQ feature: validate the configured provider. Only "openai" is fully
+	// supported in this release; other values are honored with OpenAI-shape
+	// semantics but logged so the operator sees a clear warning at startup.
+	// We only warn when the NLQ feature is enabled to avoid noise for
+	// deployments that left the [nlq] section at defaults but never opted in.
+	if cfg.NLQEnabled && cfg.NLQProvider != "openai" {
+		cfg.Logger.Warn(
+			"NLQ feature: llm_provider is not 'openai' — falling back to OpenAI-compatible request shape",
+			"configured_provider", cfg.NLQProvider,
+		)
+	}
 }
 
 type AnnotationCleanupSettings struct {

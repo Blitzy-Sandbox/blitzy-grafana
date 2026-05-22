@@ -52,8 +52,24 @@ import (
 	"os"
 	"strings"
 
+	// NLQ feature: PromQL parser used to validate the LLM's translated
+	// output is syntactically valid before returning it to the client.
+	// Imported from prometheus/prometheus which is already a direct
+	// dependency of Grafana (see go.mod) — no new dependency is added.
+	promparser "github.com/prometheus/prometheus/promql/parser"
+
+	// NLQ feature: LogQL parser used for the same purpose against the
+	// Loki dialect. Imported from grafana/loki which is already a
+	// direct dependency of Grafana (see go.mod) — no new dependency
+	// is added. ParseExpr is the strict variant that rejects empty
+	// {} selectors and other malformed expressions; this matches the
+	// validation contract a real Loki datasource would enforce.
+	logqlsyntax "github.com/grafana/loki/v3/pkg/logql/syntax"
+
 	"github.com/grafana/grafana/pkg/api/response"
+	ac "github.com/grafana/grafana/pkg/services/accesscontrol"
 	contextmodel "github.com/grafana/grafana/pkg/services/contexthandler/model"
+	"github.com/grafana/grafana/pkg/services/datasources"
 	"github.com/grafana/grafana/pkg/web"
 )
 
@@ -147,20 +163,27 @@ type parsedQuery struct {
 //     c.GetOrgID() — NEVER from the request body — so a client
 //     cannot spoof another organization's datasource by submitting
 //     an arbitrary UID.
-//  3. Translate is invoked with the validated request and the
-//     authenticated orgID. It returns a TranslateResponse on success
-//     and a typed sentinel error on failure.
-//  4. errors.Is is used to classify the returned error and map it
+//  3. UID-scoped authorization runs BEFORE any expensive work.
+//     ac.EvalPermission(datasources.ActionQuery, scope) where scope
+//     is derived from req.DatasourceUID enforces per-datasource
+//     RBAC; a caller with broad datasources:query permission cannot
+//     reach the LLM for a UID they should not query. This addresses
+//     the CRITICAL review finding that route-level evaluation was
+//     scope-less.
+//  4. Translate is invoked with the validated, authorized request
+//     and the authenticated orgID. It returns a TranslateResponse
+//     on success and a typed sentinel error on failure.
+//  5. errors.Is is used to classify the returned error and map it
 //     to the appropriate HTTP status code (see errorResponse below).
-//  5. On success, response.JSON serialises TranslateResponse with
+//  6. On success, response.JSON serialises TranslateResponse with
 //     200 OK and the application/json content type. The frontend
 //     consumes the resulting body directly.
 //
 // CORS / CSRF / auth: the upstream middleware chain registered in
-// service.go's registerAPIEndpoints (middleware.ReqSignedIn +
-// ac.EvalPermission(datasources.ActionQuery)) has already enforced
-// authentication and permission before this handler runs. There is
-// nothing for the handler itself to verify on the auth axis.
+// service.go's registerAPIEndpoints (middleware.ReqSignedIn) has
+// enforced authentication before this handler runs. UID-scoped
+// authorization happens here because the target UID is only
+// available after the request body has been parsed.
 func (s *Service) PostTranslate(c *contextmodel.ReqContext) response.Response {
 	req := TranslateRequest{}
 	if err := web.Bind(c.Req, &req); err != nil {
@@ -171,11 +194,41 @@ func (s *Service) PostTranslate(c *contextmodel.ReqContext) response.Response {
 		return response.Error(http.StatusBadRequest, "bad request data", err)
 	}
 
+	// NLQ feature CRITICAL fix: validate that DatasourceUID is
+	// present and non-whitespace BEFORE invoking the access-control
+	// system. ScopeProvider.GetResourceScopeUID(req.DatasourceUID)
+	// would otherwise compose a malformed scope like
+	// "datasources:uid:" and accidentally match a permission
+	// configured with the same prefix. Failing fast with 400 also
+	// matches the AAP §0.8.5 contract: "validate the input payload
+	// before invoking the LLM".
+	if strings.TrimSpace(req.DatasourceUID) == "" {
+		return response.Error(http.StatusBadRequest, "datasourceUid is required", ErrInvalidDatasource)
+	}
+
 	// orgID is read from the authenticated session — see the
 	// security note in the function-level comment. c.GetOrgID() is
 	// inherited from the embedded *user.SignedInUser on
 	// *contextmodel.ReqContext.
 	orgID := c.GetOrgID()
+
+	// NLQ feature CRITICAL fix: UID-scoped datasources:query
+	// authorization. We evaluate the permission against the
+	// body-supplied UID by composing the scope via
+	// datasources.ScopeProvider.GetResourceScopeUID(uid). This is
+	// the same scope shape used by the existing /api/ds/query route
+	// and by pkg/services/ngalert/accesscontrol/rules.go's
+	// getRulesQueryEvaluator. A caller without permission for THIS
+	// specific UID is rejected with 403 Forbidden BEFORE any
+	// schema fetch or LLM call occurs.
+	//
+	// SECURITY (AAP §0.8.5): the access-control error (if any) is
+	// logged at debug level only; the response surface uses the
+	// typed ErrForbiddenDatasource so no underlying error message
+	// can leak into the client-visible response body.
+	if err := s.authorizeDatasourceQuery(c, req.DatasourceUID); err != nil {
+		return s.errorResponse(err)
+	}
 
 	resp, err := s.Translate(c.Req.Context(), req, orgID)
 	if err != nil {
@@ -183,6 +236,60 @@ func (s *Service) PostTranslate(c *contextmodel.ReqContext) response.Response {
 	}
 
 	return response.JSON(http.StatusOK, resp)
+}
+
+// authorizeDatasourceQuery enforces UID-scoped datasources:query
+// permission on the authenticated caller. Called from PostTranslate
+// AFTER request body binding (so req.DatasourceUID is known) and
+// BEFORE any schema fetch / LLM call (so an unauthorized caller
+// cannot trigger upstream work).
+//
+// Returns:
+//   - nil when the caller is authorized.
+//   - ErrForbiddenDatasource when the caller lacks the permission
+//     (mapped to 403 by errorResponse).
+//   - ErrForbiddenDatasource (also) when the access-control system
+//     itself returns an error; we DO NOT distinguish between
+//     "infrastructure failure" and "no permission" in the response
+//     surface because doing so could allow a caller to probe the
+//     state of the auth backend (oracle attack). The underlying
+//     error is logged at debug level so operators can diagnose.
+//
+// SECURITY (AAP §0.8.5):
+//   - dsUID is included in the debug log line because it is a
+//     non-secret identifier supplied by the caller.
+//   - The underlying err is logged but NOT returned to the client.
+//   - No portion of req.NaturalLanguage reaches the log or the
+//     response — see the body of PostTranslate which never logs
+//     the request.
+func (s *Service) authorizeDatasourceQuery(c *contextmodel.ReqContext, dsUID string) error {
+	if s.ac == nil {
+		// Defense-in-depth: if access control is not wired (e.g. a
+		// misbehaving test fixture), treat as denied rather than
+		// falling open. This contradicts the test convention of
+		// "ExpectedEvaluate: true on FakeAccessControl" but it
+		// only triggers when the AccessControl field is nil — which
+		// no production constructor path produces.
+		s.log.Debug("NLQ feature: access control not configured; denying request", "datasourceUID", dsUID)
+		return ErrForbiddenDatasource
+	}
+
+	evaluator := ac.EvalPermission(datasources.ActionQuery, datasources.ScopeProvider.GetResourceScopeUID(dsUID))
+	hasAccess, err := s.ac.Evaluate(c.Req.Context(), c.SignedInUser, evaluator)
+	if err != nil {
+		// SECURITY: log only the UID and a generic error message;
+		// surface only ErrForbiddenDatasource to the client.
+		s.log.Debug(
+			"NLQ feature: access control evaluation failed",
+			"datasourceUID", dsUID,
+			"err", err,
+		)
+		return ErrForbiddenDatasource
+	}
+	if !hasAccess {
+		return ErrForbiddenDatasource
+	}
+	return nil
 }
 
 // errorResponse maps a typed error from Translate to an HTTP
@@ -212,6 +319,20 @@ func (s *Service) errorResponse(err error) response.Response {
 		return response.Error(http.StatusBadRequest, "natural language input is required", err)
 	case errors.Is(err, ErrUnsupportedDatasource):
 		return response.Error(http.StatusBadRequest, "unsupported datasource type", err)
+	case errors.Is(err, ErrInvalidDatasource):
+		// NLQ feature MAJOR fix: invalid UID, unresolvable UID, or
+		// claimed/registered type mismatch all surface as 400 Bad
+		// Request. The earlier behavior of downgrading these to
+		// warnings allowed callers to trigger LLM calls with
+		// inconsistent datasource identity.
+		return response.Error(http.StatusBadRequest, "invalid datasource for this request", err)
+	case errors.Is(err, ErrForbiddenDatasource):
+		// NLQ feature CRITICAL fix: UID-scoped authorization
+		// failure. The response.Error err argument is nil to
+		// prevent any wrapped underlying detail from reaching the
+		// client (the wrapped detail, if present, would have been
+		// logged by authorizeDatasourceQuery already).
+		return response.Error(http.StatusForbidden, "not authorized to query this datasource", nil)
 	case errors.Is(err, ErrMissingAPIKey):
 		// 500 (not 401/403) because this is an operator
 		// misconfiguration, not a caller problem. The caller
@@ -227,6 +348,13 @@ func (s *Service) errorResponse(err error) response.Response {
 			"error", "GF_NLQ_LLM_API_KEY not set",
 		)
 		return response.Error(http.StatusInternalServerError, "NLQ LLM provider is not configured", nil)
+	case errors.Is(err, ErrInvalidQuerySyntax):
+		// NLQ feature MAJOR fix: 502 Bad Gateway because the
+		// failure originated in the upstream LLM (it produced a
+		// syntactically invalid PromQL/LogQL string). The wrapped
+		// parser error message IS safe to surface — it contains
+		// only language-spec diagnostics, never Grafana secrets.
+		return response.Error(http.StatusBadGateway, "NLQ LLM produced an invalid query", err)
 	case errors.Is(err, ErrLLMUnavailable):
 		// 502 Bad Gateway because the immediate failure is in an
 		// upstream service (the LLM provider), not in Grafana.
@@ -240,14 +368,22 @@ func (s *Service) errorResponse(err error) response.Response {
 //
 // Phases:
 //
-//  1. Input validation: NaturalLanguage must be non-empty (after
-//     TrimSpace); DatasourceType must resolve to a supported language
-//     via supportedLanguages.
+//  1. Input validation (HARD failures — return without LLM call):
+//     - NaturalLanguage must be non-empty (after TrimSpace).
+//     - DatasourceUID must be non-empty (after TrimSpace).
+//     - DatasourceType must resolve to a supported language via
+//     supportedLanguages.
 //
-//  2. Schema context fetch (best-effort): fetchSchemaContext looks
-//     up the datasource by UID and seeds a SchemaContext. Any error
-//     here is downgraded to a Warnings entry on the response —
-//     translation proceeds with an empty SchemaContext.
+//  2. Schema context fetch — HYBRID failure semantics:
+//     - HARD failures (datasource UID unresolved, type mismatch
+//     between request and registered datasource): fail with
+//     ErrInvalidDatasource. The translation never reaches the
+//     LLM with an inconsistent datasource identity. This
+//     addresses the MAJOR review finding that previously
+//     downgraded these to warnings.
+//     - SOFT failures (live metadata fetch failed but the
+//     datasource exists and types match): proceed with the
+//     base hints, attach a Warnings entry.
 //
 //  3. Prompt construction: buildPrompt yields a system prompt
 //     (instructions + schema hints) and a user prompt (the raw
@@ -257,9 +393,13 @@ func (s *Service) errorResponse(err error) response.Response {
 //     configured provider endpoint with the API key from
 //     GF_NLQ_LLM_API_KEY.
 //
-//  5. Response parsing: parseResponse extracts the JSON object
-//     from Choices[0].Message.Content and validates that the
-//     Query field is non-empty.
+//  5. Response parsing + syntactic validation: parseResponse
+//     extracts the JSON object from Choices[0].Message.Content;
+//     validateQuerySyntax parses the resulting query string with
+//     the language-specific parser (PromQL or LogQL). A parser
+//     error becomes ErrInvalidQuerySyntax. This addresses the
+//     MAJOR review finding that previous behavior only checked
+//     for non-emptiness.
 //
 //  6. Final assembly: the TranslateResponse is composed from the
 //     parsed query, the language identifier, the explanation, and
@@ -287,6 +427,17 @@ func (s *Service) Translate(ctx context.Context, req TranslateRequest, orgID int
 	// consumers (prompt builder) see a normalized string.
 	req.NaturalLanguage = naturalLanguage
 
+	// NLQ feature MAJOR fix: validate DatasourceUID is non-empty/
+	// non-whitespace before any schema fetch or LLM call. The
+	// PostTranslate handler also performs this check before the
+	// authorization step, but Translate may be called directly
+	// from tests or future callers — defense-in-depth.
+	dsUID := strings.TrimSpace(req.DatasourceUID)
+	if dsUID == "" {
+		return TranslateResponse{}, fmt.Errorf("%w: datasourceUid is empty", ErrInvalidDatasource)
+	}
+	req.DatasourceUID = dsUID
+
 	normalizedType := strings.ToLower(strings.TrimSpace(req.DatasourceType))
 	language, ok := supportedLanguages[normalizedType]
 	if !ok {
@@ -297,24 +448,35 @@ func (s *Service) Translate(ctx context.Context, req TranslateRequest, orgID int
 	}
 	req.DatasourceType = normalizedType
 
-	// 2. Fetch schema context. Any error here is non-fatal and is
-	// surfaced as a Warnings entry on the response. Schema-fetch
-	// failures should never block translation (per AAP §0.6.1.1
-	// test case (f) "schema-fetch failure path produces a response
-	// with Warnings populated").
+	// 2. Fetch schema context. The fetcher distinguishes two error
+	// classes (per the MAJOR review finding):
+	//   - HARD: datasource lookup failed OR registered type does
+	//     not match the request's claim. These come back wrapped
+	//     in ErrInvalidDatasource and short-circuit the entire
+	//     translation with a 400 response. No LLM call is made.
+	//   - SOFT: any other error (e.g. the live /api/v1/labels
+	//     metadata fetch hit a 5xx). These come back wrapped in
+	//     a generic transport error and are downgraded to a
+	//     Warnings entry. The translation proceeds with the base
+	//     hints.
 	var warnings []string
 	schemaCtx, schemaErr := s.fetchSchemaContext(ctx, req, orgID)
 	if schemaErr != nil {
-		// The schema context fetcher already logs the failure at
-		// debug level; here we only translate it into a user-
-		// visible warning. The warning text is generic and does
-		// not echo the underlying error message (which may include
-		// datasource configuration metadata not safe for the
-		// client).
-		warnings = append(warnings, "Schema context was unavailable; translation proceeded without datasource-specific hints.")
-		// Empty SchemaContext is a valid input to buildPrompt
-		// (it falls back to language-general hints only).
-		schemaCtx = SchemaContext{}
+		if errors.Is(schemaErr, ErrInvalidDatasource) {
+			// HARD fail: the datasource UID is not consistent with
+			// the request's claim. errorResponse maps this to 400.
+			return TranslateResponse{}, schemaErr
+		}
+		// SOFT fail: the datasource exists and the type matches,
+		// but the live metadata fetch was unsuccessful. Continue
+		// with the (possibly partially populated) base schema
+		// context returned by fetchSchemaContext.
+		s.log.Debug(
+			"NLQ feature: live schema metadata fetch failed; proceeding with base hints",
+			"datasourceUID", req.DatasourceUID,
+			"err", schemaErr,
+		)
+		warnings = append(warnings, "Live schema metadata was unavailable; translation proceeded with general datasource hints.")
 	}
 
 	// 3. Build the LLM prompt.
@@ -335,6 +497,19 @@ func (s *Service) Translate(ctx context.Context, req TranslateRequest, orgID int
 		return TranslateResponse{}, err
 	}
 
+	// 5a. NLQ feature MAJOR fix: syntactic validation against the
+	// language-specific parser. A failure here is treated as an
+	// upstream issue (502 Bad Gateway) — the request was valid;
+	// the LLM produced an unusable result.
+	if err := validateQuerySyntax(parsed.Query, language); err != nil {
+		s.log.Warn(
+			"NLQ feature: LLM produced syntactically invalid query",
+			"language", language,
+			"err", err,
+		)
+		return TranslateResponse{}, fmt.Errorf("%w: %v", ErrInvalidQuerySyntax, err)
+	}
+
 	// 6. Assemble the response.
 	return TranslateResponse{
 		Query:       parsed.Query,
@@ -342,6 +517,52 @@ func (s *Service) Translate(ctx context.Context, req TranslateRequest, orgID int
 		Explanation: parsed.Explanation,
 		Warnings:    warnings,
 	}, nil
+}
+
+// validateQuerySyntax parses the LLM-produced query string with the
+// language-specific parser (PromQL or LogQL) and returns a
+// non-nil error if the parser rejects the string. A nil return
+// indicates the query is syntactically well-formed and safe to
+// surface to the client.
+//
+// The parser libraries used here are already in Grafana's module
+// graph (see go.mod — github.com/prometheus/prometheus and
+// github.com/grafana/loki/v3) so no new dependency is introduced.
+//
+// SECURITY (AAP §0.8.5): the returned error wraps the parser's own
+// error message verbatim. Parser errors describe language-spec
+// violations (e.g., "expected colon but got identifier") and never
+// contain Grafana-internal secrets. Tests confirm the API key
+// cannot appear in this error path (TestTranslate_APIKeyNotLeaked).
+//
+// language is the language identifier already resolved by Translate
+// — one of "promql" or "logql". An unexpected value returns nil
+// (we cannot validate something we do not understand; the LLM-
+// output is the safer default than rejecting all queries for an
+// unrecognised dialect).
+func validateQuerySyntax(query, language string) error {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		// parseResponse already rejects empty queries before
+		// calling this helper; defensive check preserves the
+		// invariant regardless of refactor order.
+		return errors.New("query is empty after whitespace trim")
+	}
+	switch language {
+	case "promql":
+		if _, err := promparser.ParseExpr(q); err != nil {
+			return err
+		}
+	case "logql":
+		if _, err := logqlsyntax.ParseExpr(q); err != nil {
+			return err
+		}
+	default:
+		// Unrecognised language — skip validation. supportedLanguages
+		// is the source of truth and only emits "promql" or "logql",
+		// so this branch is defensive.
+	}
+	return nil
 }
 
 // buildPrompt constructs the (system, user) prompt pair for the
@@ -461,17 +682,25 @@ func (s *Service) callLLM(ctx context.Context, systemPrompt, userPrompt string) 
 	// returned error.
 	httpResp, err := s.httpClient.Do(httpReq)
 	if err != nil {
-		// SECURITY (AAP §0.8.5): only the URL host (NOT the full
-		// URL, which could in pathological cases contain embedded
-		// credentials) and the error class are logged. The prompts
-		// and API key are NEVER part of the log line. The configured
+		// SECURITY (AAP §0.8.5): http.Client.Do wraps transport
+		// errors in *url.Error, which includes the full request
+		// URL — including any path, query, or (in pathological
+		// misconfigurations) userinfo embedded in the endpoint
+		// configuration. The sanitizeTransportError helper unwraps
+		// *url.Error and returns ONLY the inner error message, so
+		// the configured endpoint cannot leak through the log or
+		// the response envelope. Only the URL host (which is
+		// non-secret operator configuration) is included in the
+		// structured log fields via safeHost. The prompts and API
+		// key are NEVER part of the log line. The configured
 		// model name is non-secret operator configuration.
+		sanitized := sanitizeTransportError(err)
 		s.log.Error("NLQ feature: LLM call transport failure",
 			"host", safeHost(s.cfg.NLQEndpoint),
 			"model", s.cfg.NLQModel,
-			"err", err,
+			"err", sanitized,
 		)
-		return nil, fmt.Errorf("%w: %v", ErrLLMUnavailable, err)
+		return nil, fmt.Errorf("%w: transport failure: %s", ErrLLMUnavailable, sanitized)
 	}
 	defer func() {
 		// Drain and close the body so the underlying connection
@@ -487,13 +716,18 @@ func (s *Service) callLLM(ctx context.Context, systemPrompt, userPrompt string) 
 	const maxResponseBytes = 1 << 20 // 1 MiB
 	respBytes, err := io.ReadAll(io.LimitReader(httpResp.Body, maxResponseBytes))
 	if err != nil {
+		// SECURITY (AAP §0.8.5): apply the same sanitization the
+		// transport-failure branch uses. io.ReadAll over an HTTP
+		// response body can surface *url.Error or transport-layer
+		// errors that include the full request URL.
+		sanitized := sanitizeTransportError(err)
 		s.log.Error("NLQ feature: LLM response read failure",
 			"host", safeHost(s.cfg.NLQEndpoint),
 			"model", s.cfg.NLQModel,
 			"status", httpResp.StatusCode,
-			"err", err,
+			"err", sanitized,
 		)
-		return nil, fmt.Errorf("%w: read response: %v", ErrLLMUnavailable, err)
+		return nil, fmt.Errorf("%w: read response: %s", ErrLLMUnavailable, sanitized)
 	}
 
 	// 6. Check the HTTP status. Anything outside 2xx is a
@@ -598,17 +832,16 @@ func stripCodeFences(s string) string {
 		// fence trim on whatever remains.
 		s = strings.TrimPrefix(s, "```")
 		s = strings.TrimSpace(s)
-		if strings.HasSuffix(s, "```") {
-			s = strings.TrimSuffix(s, "```")
-		}
+		// TrimSuffix is a no-op when the suffix is absent, so the
+		// HasSuffix guard was redundant (staticcheck S1017).
+		s = strings.TrimSuffix(s, "```")
 		return strings.TrimSpace(s)
 	}
 	s = s[idx+1:]
 	// Strip the closing fence, tolerating trailing whitespace.
 	s = strings.TrimSpace(s)
-	if strings.HasSuffix(s, "```") {
-		s = strings.TrimSuffix(s, "```")
-	}
+	// TrimSuffix is a no-op when the suffix is absent (staticcheck S1017).
+	s = strings.TrimSuffix(s, "```")
 	return strings.TrimSpace(s)
 }
 
@@ -640,4 +873,64 @@ func safeHost(rawURL string) string {
 		return "<invalid-endpoint>"
 	}
 	return u.Host
+}
+
+// sanitizeTransportError converts a transport-layer error from
+// net/http into a string suitable for logging and returning to the
+// client without leaking the full request URL.
+//
+// MOTIVATION (NLQ feature MAJOR review finding, translate.go L469-474):
+// http.Client.Do wraps transport-level errors (DNS failure, TCP
+// reset, TLS handshake error, context deadline) in *url.Error. The
+// *url.Error.Error() method renders as:
+//
+//	"<Op> <URL>: <inner error>"
+//
+// where <URL> is the FULL request URL — scheme, host, path, query,
+// and (in pathological misconfigurations) userinfo. That partially
+// defeats the safeHost helper used in adjacent structured log
+// fields. If an operator misconfigures NLQEndpoint with embedded
+// credentials, or includes a sensitive path segment, the full URL
+// would otherwise reach the log stream and the HTTP response
+// envelope.
+//
+// SANITIZATION:
+//   - For *url.Error values, return ONLY the inner error message
+//     (err.Err.Error()) prefixed by the operation name. The URL
+//     component is dropped entirely; the host is available via
+//     the separately-logged safeHost field.
+//   - For all other error values, return err.Error() unchanged.
+//     These typically come from io.ReadAll on a successful
+//     response and do not contain the request URL.
+//
+// SECURITY GUARANTEE (AAP §0.8.5): the API key, the configured
+// endpoint path/query/userinfo, and the user-supplied natural
+// language prompt MUST NEVER appear in the returned string. Tests
+// (TestTranslate_APIKeyNotLeaked, TestSanitizeTransportError_*)
+// codify this invariant.
+//
+// Returns "<transport error>" for a nil input (defensive — callers
+// should not pass nil, but the helper preserves the invariant
+// without panicking).
+func sanitizeTransportError(err error) string {
+	if err == nil {
+		return "<transport error>"
+	}
+	// Unwrap *url.Error and use only the operation name + inner
+	// error message. errors.As walks the chain in case the
+	// transport error has been wrapped by an intermediate layer.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		op := urlErr.Op
+		if op == "" {
+			op = "request"
+		}
+		if urlErr.Err == nil {
+			return op + ": transport failure"
+		}
+		// Recurse to sanitize any further nested *url.Error
+		// (transport stacks can wrap multiple times in edge cases).
+		return op + ": " + sanitizeTransportError(urlErr.Err)
+	}
+	return err.Error()
 }

@@ -126,8 +126,11 @@ type SchemaContext struct {
 //
 //	ErrEmptyInput            -> 400 Bad Request
 //	ErrUnsupportedDatasource -> 400 Bad Request
+//	ErrInvalidDatasource     -> 400 Bad Request
+//	ErrForbiddenDatasource   -> 403 Forbidden
 //	ErrMissingAPIKey         -> 500 Internal Server Error
 //	ErrLLMUnavailable        -> 502 Bad Gateway
+//	ErrInvalidQuerySyntax    -> 502 Bad Gateway (the upstream LLM produced an unusable query)
 //
 // Callers MUST use errors.Is for classification because the Translate
 // orchestrator wraps these sentinels with %w to add contextual detail
@@ -157,6 +160,39 @@ var (
 	// still classify the result correctly.
 	ErrUnsupportedDatasource = errors.New("nlq: unsupported datasource type")
 
+	// ErrInvalidDatasource is returned when the request's
+	// DatasourceUID is empty/whitespace-only, when the UID does not
+	// resolve to a registered datasource in the caller's org, or
+	// when the registered datasource's type does not match the
+	// request's claimed datasourceType. PostTranslate surfaces this
+	// as a 400 Bad Request.
+	//
+	// This sentinel is distinct from ErrUnsupportedDatasource because
+	// the latter signals "this datasource flavor is not implemented
+	// by NLQ" while ErrInvalidDatasource signals "the provided UID
+	// or type pairing is invalid for THIS request". The distinction
+	// allows clients (and tests) to differentiate "data source kind
+	// not supported" from "data source identifier rejected".
+	//
+	// SECURITY (AAP §0.8.5): callers wrapping this sentinel MUST NOT
+	// include the underlying GetDataSource error message verbatim
+	// when it could leak datasource configuration metadata (URL,
+	// credentials, JsonData). Wrapping with just the UID and the
+	// registered/claimed type is safe.
+	ErrInvalidDatasource = errors.New("nlq: invalid datasource for this request")
+
+	// ErrForbiddenDatasource is returned when the authenticated
+	// caller lacks the datasources:query permission scoped to the
+	// requested DatasourceUID. PostTranslate surfaces this as a 403
+	// Forbidden, mirroring Grafana's standard RBAC denial response.
+	//
+	// CRITICAL (AAP §0.8.5 / §0.6.4 row 7 — RBAC): this sentinel
+	// gates the request-body-aware authorization step performed
+	// AFTER the request body is parsed (UID-scoped). It MUST NOT
+	// be confused with the route-level signed-in check, which fires
+	// before the handler ever runs.
+	ErrForbiddenDatasource = errors.New("nlq: caller is not authorized to query this datasource")
+
 	// ErrMissingAPIKey is returned when the GF_NLQ_LLM_API_KEY
 	// environment variable is unset or empty at translate time.
 	//
@@ -178,4 +214,18 @@ var (
 	// the HTTP status code and a generic transport-level error are
 	// safe to include.
 	ErrLLMUnavailable = errors.New("nlq: LLM provider is unavailable")
+
+	// ErrInvalidQuerySyntax is returned when the LLM produces a
+	// query string that fails syntactic validation against the
+	// target language parser (PromQL or LogQL). PostTranslate
+	// surfaces this as a 502 Bad Gateway because the LLM is
+	// upstream and the failure originated there — the request
+	// itself was valid.
+	//
+	// The wrapped message includes the parser's error text (which
+	// is part of the public language specification and contains no
+	// Grafana-internal secrets) so the operator can diagnose
+	// LLM-side issues from logs. The wrapped message MUST NOT
+	// include the prompt or any other secret material.
+	ErrInvalidQuerySyntax = errors.New("nlq: LLM produced a query that failed syntactic validation")
 )

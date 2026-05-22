@@ -204,11 +204,22 @@ func ProvideService(
 		},
 	}
 
-	// NLQ feature: gate route registration on the feature flag. When
-	// the flag is off, no /api/nlq/* route is mounted — this ensures
-	// the server is exactly equivalent to baseline Grafana when
-	// nlqEnabled=false, satisfying the Minimal Change Clause
-	// (AAP §0.8.1) and the off-by-default requirement (AAP §0.1.1).
+	// NLQ feature: gate route registration on BOTH gates (per
+	// conf/defaults.ini comment and AAP §0.6.3.1):
+	//   1. cfg.NLQEnabled — the operator kill switch from
+	//      [nlq] enabled (env GF_NLQ_ENABLED). Allows operators to
+	//      disable the feature even when the feature flag is on, e.g.
+	//      to take the LLM endpoint down for maintenance.
+	//   2. featuremgmt.FlagNlqEnabled — the feature toggle from
+	//      pkg/services/featuremgmt/registry.go. The canonical
+	//      "is this feature shipped" gate that the frontend also
+	//      checks via config.featureToggles.nlqEnabled.
+	//
+	// When either gate is off, no /api/nlq/* route is mounted — this
+	// ensures the server is exactly equivalent to baseline Grafana
+	// when the feature is disabled, satisfying the Minimal Change
+	// Clause (AAP §0.8.1) and the off-by-default requirement
+	// (AAP §0.1.1).
 	//
 	// We use IsEnabledGlobally because nlqEnabled is an operator-
 	// controlled, server-wide flag (per AAP §0.6.3.1); per-tenant
@@ -219,30 +230,56 @@ func ProvideService(
 	// pattern for now (matching pkg/services/ldap/service/ldap.go and
 	// dozens of other call sites). A future migration to OpenFeature
 	// is out of scope for this change set per AAP §0.7.2.4.
-	//
-	//nolint:staticcheck // not yet migrated to OpenFeature
-	if features != nil && features.IsEnabledGlobally(featuremgmt.FlagNlqEnabled) {
+	if s.routeRegistrationEnabled() {
 		s.registerAPIEndpoints()
 	}
 
 	return s, nil
 }
 
+// routeRegistrationEnabled reports whether BOTH the [nlq] enabled
+// ini gate AND the nlqEnabled feature toggle are on. Extracted from
+// ProvideService as a tiny helper so the dual-gate contract is easy
+// to audit and easy to unit-test in isolation. Both inputs are
+// snapshot-read from the construction-time values; route registration
+// never changes after server startup so re-reading the gates per
+// request would not change behavior.
+//
+//nolint:staticcheck // not yet migrated to OpenFeature
+func (s *Service) routeRegistrationEnabled() bool {
+	if s.cfg == nil || !s.cfg.NLQEnabled {
+		return false
+	}
+	if s.features == nil {
+		return false
+	}
+	return s.features.IsEnabledGlobally(featuremgmt.FlagNlqEnabled)
+}
+
 // registerAPIEndpoints mounts POST /api/nlq/translate under the
 // existing route register. Authentication is enforced via
 // middleware.ReqSignedIn (the same authentication chain used by every
-// other Grafana endpoint that requires a signed-in user); authorization
-// is enforced via ac.EvalPermission(datasources.ActionQuery), which is
-// the same permission required by the legacy /api/ds/query endpoint
-// at pkg/api/api.go:L517. This parity is intentional: the NLQ feature
-// produces a query that is functionally equivalent to one the user
-// would submit to /api/ds/query, so the same RBAC gate applies.
+// other Grafana endpoint that requires a signed-in user). UID-scoped
+// authorization for datasources.ActionQuery is performed INSIDE the
+// handler (PostTranslate in translate.go), AFTER the request body has
+// been parsed, because the target datasource UID lives in the JSON
+// body and is not available to route-level middleware.
+//
+// SECURITY (AAP §0.8.5 + review feedback CRITICAL finding):
+// Earlier revisions of this method attached an authorize() middleware
+// at the route level evaluating ac.EvalPermission(datasources.ActionQuery)
+// WITHOUT a scope. That allowed a caller with any datasources:query
+// permission to reach the handler for a UID they should not query.
+// The corrected design moves the evaluation inline into the handler
+// so we can pass the body-supplied UID to
+// ac.EvalPermission(ActionQuery, ScopeProvider.GetResourceScopeUID(req.DatasourceUID)),
+// enforcing per-datasource authorization. See translate.go's
+// authorizeDatasourceQuery for the implementation.
 //
 // Pattern source: pkg/services/correlations/api.go's
-// registerAPIEndpoints (lines 16-32). The shape — Group with trailing
-// middleware.ReqSignedIn applied to every child route plus a per-route
-// authorize(ac.EvalPermission(...)) wrapper — is the canonical Grafana
-// pattern for a domain service that self-registers its routes.
+// registerAPIEndpoints (lines 16-32) for the Group shape;
+// pkg/services/ngalert/accesscontrol/rules.go for the UID-scoped
+// EvalPermission pattern.
 //
 // Why grouped under /api/nlq even with a single route?
 //   - Future extension (e.g. /api/nlq/feedback, /api/nlq/history)
@@ -258,11 +295,6 @@ func ProvideService(
 //   - The NLQ feature is "natural-language-to-datasource-query"; the
 //     logical permission is identical to issuing a datasource query
 //     directly.
-//   - Scope-less evaluation (no second argument to EvalPermission)
-//     matches the legacy /api/ds/query route at pkg/api/api.go:L517;
-//     the per-datasource scope check is performed by the existing
-//     access-control machinery against the user's resolved scopes,
-//     not by this route registration.
 //
 // Side effects:
 //   - This method calls s.routeRegister.Group exactly once. The
@@ -271,27 +303,19 @@ func ProvideService(
 //     practice it is always called from ProvideService at server
 //     startup, before Run.
 func (s *Service) registerAPIEndpoints() {
-	// authorize is the per-route middleware factory bound to this
-	// service's AccessControl. Reusing a single closure (rather than
-	// recomputing ac.Middleware on each Post) makes the registration
-	// loop cheaper and reads more naturally.
-	authorize := ac.Middleware(s.ac)
-
 	// NLQ feature: register the translation endpoint. Routes inside
 	// the Group inherit the trailing middleware.ReqSignedIn so an
 	// unauthenticated caller is rejected before any handler logic
-	// runs. The per-route authorize(...) wrapper then enforces the
-	// datasources:query permission, returning 403 Forbidden if the
-	// caller lacks it.
+	// runs. UID-scoped datasources:query authorization is performed
+	// inside the handler (PostTranslate) after the request body has
+	// been bound — this is required to evaluate the permission
+	// against the body-supplied DatasourceUID. See the function-level
+	// comment for the security rationale.
 	s.routeRegister.Group("/api/nlq", func(nlqRoute routing.RouteRegister) {
 		// NLQ feature: POST /api/nlq/translate handler binding.
-		// routing.Wrap adapts (s.PostTranslate, declared in
+		// routing.Wrap adapts s.PostTranslate (declared in
 		// translate.go) from the response.Response-returning
 		// Grafana convention into the underlying web.Handler shape.
-		nlqRoute.Post(
-			"/translate",
-			authorize(ac.EvalPermission(datasources.ActionQuery)),
-			routing.Wrap(s.PostTranslate),
-		)
+		nlqRoute.Post("/translate", routing.Wrap(s.PostTranslate))
 	}, middleware.ReqSignedIn)
 }
